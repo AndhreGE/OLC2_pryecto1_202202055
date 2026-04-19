@@ -151,19 +151,6 @@ function boolToInt(value: boolean): number {
   return value ? 1 : 0;
 }
 
-function isIntLikeType(dataType: PrimitiveType): boolean {
-  return dataType === "int" || dataType === "bool" || dataType === "rune";
-}
-
-function isFloatCompatibleType(dataType: PrimitiveType): boolean {
-  return (
-    dataType === "float64" ||
-    dataType === "int" ||
-    dataType === "bool" ||
-    dataType === "rune"
-  );
-}
-
 function formatFloat(value: number): string {
   return Number.isInteger(value) ? value.toFixed(1) : String(value);
 }
@@ -275,9 +262,7 @@ function evaluateAddition(
   errors: CompilerError[]
 ): RuntimeValue {
   if (left.dataType === "string" || right.dataType === "string") {
-    return makeString(
-      `${formatValueForPrint(left)}${formatValueForPrint(right)}`
-    );
+    return makeString(`${formatValueForPrint(left)}${formatValueForPrint(right)}`);
   }
 
   if (left.dataType === "float64" || right.dataType === "float64") {
@@ -365,7 +350,7 @@ function evaluateMultiplication(
       return pushSemanticError(
         errors,
         node,
-        'No se puede repetir una cadena una cantidad negativa de veces.'
+        "No se puede repetir una cadena una cantidad negativa de veces."
       );
     }
 
@@ -411,10 +396,8 @@ function evaluateDivision(
   node: AstNode,
   errors: CompilerError[]
 ): RuntimeValue {
-  const leftAllowed =
-    left.dataType === "int" || left.dataType === "float64";
-  const rightAllowed =
-    right.dataType === "int" || right.dataType === "float64";
+  const leftAllowed = left.dataType === "int" || left.dataType === "float64";
+  const rightAllowed = right.dataType === "int" || right.dataType === "float64";
 
   if (!leftAllowed || !rightAllowed) {
     return pushSemanticError(
@@ -431,7 +414,7 @@ function evaluateDivision(
     return pushSemanticError(
       errors,
       node,
-      'No se puede dividir entre 0.'
+      "No se puede dividir entre 0."
     );
   }
 
@@ -463,7 +446,7 @@ function evaluateModulo(
     return pushSemanticError(
       errors,
       node,
-      'No se puede calcular módulo entre 0.'
+      "No se puede calcular módulo entre 0."
     );
   }
 
@@ -486,8 +469,112 @@ function evaluateUnaryMinus(
   return pushSemanticError(
     errors,
     node,
-    'La negación unaria solo se aplica a int y float64.'
+    "La negación unaria solo se aplica a int y float64."
   );
+}
+
+function evaluateEqualityComparison(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  operator: "==" | "!=",
+  node: AstNode,
+  errors: CompilerError[]
+): RuntimeValue {
+  let result: boolean | null = null;
+
+  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
+  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+
+  if (leftNumeric && rightNumeric) {
+    result = Number(left.value) === Number(right.value);
+  } else if (left.dataType === right.dataType) {
+    switch (left.dataType) {
+      case "bool":
+        result = Boolean(left.value) === Boolean(right.value);
+        break;
+      case "string":
+        result = String(left.value) === String(right.value);
+        break;
+      case "rune":
+        result = String(left.value) === String(right.value);
+        break;
+      case "int":
+      case "float64":
+        result = Number(left.value) === Number(right.value);
+        break;
+    }
+  } else {
+    errors.push({
+      type: "Semantico",
+      description: `No se puede comparar ${left.dataType} con ${right.dataType} usando "${operator}".`,
+      line: node.line,
+      column: node.column
+    });
+    return makeInt(0);
+  }
+
+  return makeBool(operator === "==" ? result : !result);
+}
+
+function evaluateRelationalComparison(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  operator: ">" | "<" | ">=" | "<=",
+  node: AstNode,
+  errors: CompilerError[]
+): RuntimeValue {
+  let result: boolean | null = null;
+
+  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
+  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+
+  if (leftNumeric && rightNumeric) {
+    const l = Number(left.value);
+    const r = Number(right.value);
+
+    switch (operator) {
+      case ">":
+        result = l > r;
+        break;
+      case "<":
+        result = l < r;
+        break;
+      case ">=":
+        result = l >= r;
+        break;
+      case "<=":
+        result = l <= r;
+        break;
+    }
+  } else if (left.dataType === "rune" && right.dataType === "rune") {
+    const l = runeToCode(String(left.value));
+    const r = runeToCode(String(right.value));
+
+    switch (operator) {
+      case ">":
+        result = l > r;
+        break;
+      case "<":
+        result = l < r;
+        break;
+      case ">=":
+        result = l >= r;
+        break;
+      case "<=":
+        result = l <= r;
+        break;
+    }
+  } else {
+    errors.push({
+      type: "Semantico",
+      description: `No se puede comparar ${left.dataType} con ${right.dataType} usando "${operator}".`,
+      line: node.line,
+      column: node.column
+    });
+    return makeInt(0);
+  }
+
+  return makeBool(Boolean(result));
 }
 
 function evaluateBinaryExpression(
@@ -521,6 +608,18 @@ function evaluateBinaryExpression(
       return evaluateDivision(left, right, node, errors);
     case "%":
       return evaluateModulo(left, right, node, errors);
+    case "==":
+      return evaluateEqualityComparison(left, right, "==", node, errors);
+    case "!=":
+      return evaluateEqualityComparison(left, right, "!=", node, errors);
+    case ">":
+      return evaluateRelationalComparison(left, right, ">", node, errors);
+    case "<":
+      return evaluateRelationalComparison(left, right, "<", node, errors);
+    case ">=":
+      return evaluateRelationalComparison(left, right, ">=", node, errors);
+    case "<=":
+      return evaluateRelationalComparison(left, right, "<=", node, errors);
     default:
       return pushSemanticError(
         errors,

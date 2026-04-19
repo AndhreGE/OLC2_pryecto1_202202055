@@ -46,7 +46,9 @@ function decodeRune(text) {
 
 %token FUNC VAR FMT PRINTLN TYPE_INT TYPE_FLOAT64 TYPE_STRING TYPE_BOOL TYPE_RUNE
 %token IDENTIFIER STRING INT FLOAT BOOL RUNE DECLARE EOF
+%token EQ NEQ GTE LTE
 
+%left EQ NEQ '<' '>' GTE LTE
 %left '+' '-'
 %left '*' '/' '%'
 %right UMINUS
@@ -74,6 +76,10 @@ function decodeRune(text) {
 "true"|"false"                                  return 'BOOL';
 
 ":="                                            return 'DECLARE';
+"=="                                            return 'EQ';
+"!="                                            return 'NEQ';
+">="                                            return 'GTE';
+"<="                                            return 'LTE';
 "="                                             return '=';
 ","                                             return ',';
 ";"                                             return ';';
@@ -87,6 +93,8 @@ function decodeRune(text) {
 "*"                                             return '*';
 "/"                                             return '/';
 "%"                                             return '%';
+">"                                             return '>';
+"<"                                             return '<';
 
 [0-9]+\.[0-9]+                                  return 'FLOAT';
 [0-9]+                                          return 'INT';
@@ -242,6 +250,18 @@ expression
         { $$ = createNode('BinaryExpression', '/', @2, [$1, $3]); }
     | expression '%' expression
         { $$ = createNode('BinaryExpression', '%', @2, [$1, $3]); }
+    | expression EQ expression
+        { $$ = createNode('BinaryExpression', '==', @2, [$1, $3]); }
+    | expression NEQ expression
+        { $$ = createNode('BinaryExpression', '!=', @2, [$1, $3]); }
+    | expression '>' expression
+        { $$ = createNode('BinaryExpression', '>', @2, [$1, $3]); }
+    | expression '<' expression
+        { $$ = createNode('BinaryExpression', '<', @2, [$1, $3]); }
+    | expression GTE expression
+        { $$ = createNode('BinaryExpression', '>=', @2, [$1, $3]); }
+    | expression LTE expression
+        { $$ = createNode('BinaryExpression', '<=', @2, [$1, $3]); }
     | '-' expression %prec UMINUS
         { $$ = createNode('UnaryExpression', '-', @1, [$2]); }
     | '(' expression ')'
