@@ -154,8 +154,45 @@ function_list
     ;
 
 function_decl
-    : FUNC IDENTIFIER '(' ')' block
-        { $$ = createNode('FunctionDeclaration', $2, @2, [$5]); }
+    : FUNC IDENTIFIER '(' param_list_opt ')' return_type_opt block
+        {
+          $$ = createNode('FunctionDeclaration', $2, @2, [
+            createNode('Parameters', null, @4, $4),
+            $6,
+            $7
+          ]);
+        }
+    ;
+
+param_list_opt
+    : param_list
+        { $$ = $1; }
+    |
+        { $$ = []; }
+    ;
+
+param_list
+    : param_list ',' param_decl
+        { $$ = $1.concat([$3]); }
+    | param_decl
+        { $$ = [$1]; }
+    ;
+
+param_decl
+    : IDENTIFIER type_spec
+        {
+          $$ = createNode('Parameter', null, @1, [
+            createNode('Identifier', $1, @1, []),
+            $2
+          ]);
+        }
+    ;
+
+return_type_opt
+    : type_spec
+        { $$ = createNode('ReturnType', $1.value, @1, []); }
+    |
+        { $$ = createNode('ReturnType', 'void', null, []); }
     ;
 
 block
@@ -179,6 +216,8 @@ stmt_terminator_opt
 
 statement
     : println_stmt
+        { $$ = $1; }
+    | expr_stmt
         { $$ = $1; }
     | var_decl
         { $$ = $1; }
@@ -207,6 +246,11 @@ statement
 println_stmt
     : FMT '.' PRINTLN '(' expr_list_opt ')'
         { $$ = createNode('PrintlnStatement', null, @1, $5); }
+    ;
+
+expr_stmt
+    : call_expr
+        { $$ = createNode('ExpressionStatement', null, @1, [$1]); }
     ;
 
 if_stmt
@@ -448,6 +492,13 @@ expr_list
         { $$ = [$1]; }
     ;
 
+call_expr
+    : IDENTIFIER '(' expr_list_opt ')'
+        {
+          $$ = createNode('CallExpression', $1, @1, $3);
+        }
+    ;
+
 expression
     : expression OR expression
         { $$ = createNode('BinaryExpression', '||', @2, [$1, $3]); }
@@ -481,6 +532,8 @@ expression
         { $$ = createNode('UnaryExpression', '-', @1, [$2]); }
     | '(' expression ')'
         { $$ = $2; }
+    | call_expr
+        { $$ = $1; }
     | literal
         { $$ = $1; }
     | IDENTIFIER
