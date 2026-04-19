@@ -19,16 +19,24 @@ export function createServer() {
   app.post(
     "/execute",
     (req: Request<{}, {}, ExecuteRequestBody>, res: Response) => {
-      const { code } = req.body;
+      try {
+        const { code } = req.body;
 
-      if (typeof code !== "string") {
-        return res.status(400).json({
-          error: "El campo 'code' es obligatorio y debe ser de tipo string."
+        if (typeof code !== "string") {
+          return res.status(400).json({
+            error: "El campo 'code' es obligatorio y debe ser de tipo string."
+          });
+        }
+
+        const result = executeSource(code);
+        return res.json(result);
+      } catch (error) {
+        console.error("Error interno en /execute:", error);
+
+        return res.status(500).json({
+          error: "Error interno del backend al ejecutar el código."
         });
       }
-
-      const result = executeSource(code);
-      return res.json(result);
     }
   );
 

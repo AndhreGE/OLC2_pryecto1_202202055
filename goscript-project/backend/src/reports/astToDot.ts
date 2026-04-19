@@ -1,46 +1,46 @@
 import type { AstNode } from "../ast/AstNode";
 
 function escapeDot(value: string): string {
-    return value
-        .replace(/\\/g, "\\\\")
-        .replace(/"/g, '\\"')
-        .replace(/\n/g, "\\n");
-    }
+  return value
+    .replace(/\\/g, "\\\\")
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, "\\n");
+}
 
 export function astToDot(root: AstNode | null): string {
-    if (!root) {
-        return "digraph AST {\n}";
+  if (!root) {
+    return "digraph AST {\n}";
+  }
+
+  let counter = 0;
+  const lines: string[] = [
+    "digraph AST {",
+    "  node [shape=box];"
+  ];
+
+  function walk(node: AstNode): string {
+    const id = `n${counter++}`;
+
+    const labelParts = [node.kind];
+
+    if (node.value) {
+      labelParts.push(node.value);
     }
 
-    let counter = 0;
-    const lines: string[] = [
-        "digraph AST {",
-        "  node [shape=box];"
-    ];
+    labelParts.push(`(${node.line},${node.column})`);
 
-    function walk(node: AstNode): string {
-        const id = `n${counter++}`;
+    lines.push(`  ${id} [label="${escapeDot(labelParts.join("\n"))}"];`);
 
-        const labelParts = [node.kind];
-
-        if (node.value) {
-        labelParts.push(node.value);
-        }
-
-        labelParts.push(`(${node.line},${node.column})`);
-
-        lines.push(`  ${id} [label="${escapeDot(labelParts.join("\\n"))}"];`);
-
-        for (const child of node.children) {
-        const childId = walk(child);
-        lines.push(`  ${id} -> ${childId};`);
-        }
-
-        return id;
+    for (const child of node.children) {
+      const childId = walk(child);
+      lines.push(`  ${id} -> ${childId};`);
     }
 
-    walk(root);
-    lines.push("}");
+    return id;
+  }
 
-    return lines.join("\n");
+  walk(root);
+  lines.push("}");
+
+  return lines.join("\n");
 }
