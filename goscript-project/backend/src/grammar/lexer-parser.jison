@@ -1,4 +1,10 @@
 %{
+/*
+  ============================================================
+  HELPERS DEL AST
+  ============================================================
+*/
+
 function safeLoc(loc) {
   return loc || { first_line: 1, first_column: 0 };
 }
@@ -40,13 +46,61 @@ function decodeRune(text) {
 
   return inner;
 }
+
+function typeNodeToText(typeNode) {
+  if (!typeNode) return "int";
+
+  if (typeNode.kind === "Type" || typeNode.kind === "NamedType") {
+    return typeNode.value || "int";
+  }
+
+  if (typeNode.kind === "ArrayType") {
+    return "[" + (typeNode.value || "0") + "]" + typeNodeToText(typeNode.children[0]);
+  }
+
+  if (typeNode.kind === "SliceType") {
+    return "[]" + typeNodeToText(typeNode.children[0]);
+  }
+
+  return typeNode.value || "int";
+}
+
+function adaptInitializerForTypedDeclaration(typeNode, exprNode, loc) {
+  if (!exprNode) return exprNode;
+
+  if (exprNode.kind === "AnonymousStructLiteral" && typeNode && typeNode.kind === "NamedType") {
+    return createNode("StructLiteral", typeNode.value, loc, exprNode.children);
+  }
+
+  return exprNode;
+}
+
+function applyPostfixOps(base, ops) {
+  var current = base;
+
+  if (!Array.isArray(ops)) {
+    return base;
+  }
+
+  for (var i = 0; i < ops.length; i++) {
+    var op = ops[i];
+
+    if (op.kind === "index") {
+      current = createNode("ArrayAccess", null, op.loc, [current, op.expr]);
+    } else if (op.kind === "field") {
+      current = createNode("FieldAccess", op.name, op.loc, [current]);
+    }
+  }
+
+  return current;
+}
 %}
 
 %locations
 
 %token FUNC VAR TYPE STRUCT FMT PRINTLN TYPE_INT TYPE_FLOAT64 TYPE_STRING TYPE_BOOL TYPE_RUNE
 %token IDENTIFIER STRING INT FLOAT BOOL RUNE DECLARE EOF
-%token EQ NEQ GTE LTE AND OR NOT IF ELSE FOR INC DEC BREAK CONTINUE RETURN
+%token EQ NEQ GTE LTE AND OR NOT IF ELSE FOR INC DEC BREAK CONTINUE RETURN RANGE
 %token SWITCH CASE DEFAULT
 
 %left OR
@@ -64,7 +118,7 @@ function decodeRune(text) {
 
 %%
 [ \t\r\n]+                                      /* ignorar espacios */
-"//"[^\n]*                                      /* comentario una línea */
+"//"[^\n]*                                      /* comentario de una línea */
 
 "func"                                          return 'FUNC';
 "var"                                           return 'VAR';
@@ -78,6 +132,7 @@ function decodeRune(text) {
 "break"                                         return 'BREAK';
 "continue"                                      return 'CONTINUE';
 "return"                                        return 'RETURN';
+"range"                                         return 'RANGE';
 "switch"                                        return 'SWITCH';
 "case"                                          return 'CASE';
 "default"                                       return 'DEFAULT';
@@ -99,6 +154,7 @@ function decodeRune(text) {
 "||"                                            return 'OR';
 "++"                                            return 'INC';
 "--"                                            return 'DEC';
+
 "!"                                             return 'NOT';
 ":"                                             return ':';
 "="                                             return '=';
@@ -141,6 +197,12 @@ function decodeRune(text) {
 
 %%
 
+/*
+  ============================================================
+  INICIO
+  ============================================================
+*/
+
 program
     : top_level_list EOF
         {
@@ -164,33 +226,76 @@ top_level_decl
         { $$ = $1; }
     ;
 
+/*
+  ============================================================
+  STRUCTS
+  ============================================================
+*/
+
 struct_decl
-    : TYPE IDENTIFIER STRUCT '{' struct_field_list_opt '}'
+    : TYPE IDENTIFIER STRUCT '{' struct_field_items_opt '}'
         {
           $$ = createNode('StructDeclaration', $2, @2, $5);
         }
+    | STRUCT IDENTIFIER '{' struct_field_items_opt '}'
+        {
+          $$ = createNode('StructDeclaration', $2, @2, $4);
+        }
     ;
 
-struct_field_list_opt
-    : struct_field_list
+struct_field_items_opt
+    : struct_field_items
         { $$ = $1; }
     |
         { $$ = []; }
     ;
 
-struct_field_list
-    : struct_field_list struct_field_decl
+struct_field_items
+    : struct_field_items struct_field_item
         { $$ = $1.concat([$2]); }
-    | struct_field_decl
+    | struct_field_item
         { $$ = [$1]; }
     ;
 
+struct_field_item
+    : struct_field_decl struct_field_sep_opt
+        { $$ = $1; }
+    ;
+
+struct_field_sep_opt
+    : ';'
+        { $$ = null; }
+    |
+        { $$ = null; }
+    ;
+
 struct_field_decl
-    : IDENTIFIER type_spec
+    : IDENTIFIER field_type
         {
           $$ = createNode('StructField', $1, @1, [$2]);
         }
+    | field_type IDENTIFIER
+        {
+          $$ = createNode('StructField', $2, @2, [$1]);
+        }
     ;
+
+field_type
+    : type_spec
+        { $$ = $1; }
+    | named_type
+        { $$ = $1; }
+    | slice_type
+        { $$ = $1; }
+    | array_type
+        { $$ = $1; }
+    ;
+
+/*
+  ============================================================
+  FUNCIONES
+  ============================================================
+*/
 
 function_decl
     : FUNC IDENTIFIER '(' param_list_opt ')' return_type_opt block
@@ -229,7 +334,9 @@ param_decl
 
 return_type_opt
     : callable_type
-        { $$ = createNode('ReturnType', $1.value, @1, []); }
+        {
+          $$ = createNode('ReturnType', typeNodeToText($1), @1, [$1]);
+        }
     |
         { $$ = createNode('ReturnType', 'void', null, []); }
     ;
@@ -239,7 +346,17 @@ callable_type
         { $$ = $1; }
     | named_type
         { $$ = $1; }
+    | slice_type
+        { $$ = $1; }
+    | array_type
+        { $$ = $1; }
     ;
+
+/*
+  ============================================================
+  BLOQUES E INSTRUCCIONES
+  ============================================================
+*/
 
 block
     : '{' stmt_list '}'
@@ -263,27 +380,17 @@ stmt_terminator_opt
 statement
     : println_stmt
         { $$ = $1; }
-    | expr_stmt
-        { $$ = $1; }
     | var_decl
         { $$ = $1; }
-    | short_decl
+    | typed_decl
         { $$ = $1; }
-    | assignment
-        { $$ = $1; }
-    | array_assignment
-        { $$ = $1; }
-    | field_assignment
+    | identifier_statement
         { $$ = $1; }
     | if_stmt
         { $$ = $1; }
     | for_stmt
         { $$ = $1; }
     | switch_stmt
-        { $$ = $1; }
-    | inc_stmt
-        { $$ = $1; }
-    | dec_stmt
         { $$ = $1; }
     | break_stmt
         { $$ = $1; }
@@ -293,15 +400,22 @@ statement
         { $$ = $1; }
     ;
 
+/*
+  ============================================================
+  PRINTLN
+  ============================================================
+*/
+
 println_stmt
     : FMT '.' PRINTLN '(' expr_list_opt ')'
         { $$ = createNode('PrintlnStatement', null, @1, $5); }
     ;
 
-expr_stmt
-    : call_expr
-        { $$ = createNode('ExpressionStatement', null, @1, [$1]); }
-    ;
+/*
+  ============================================================
+  IF
+  ============================================================
+*/
 
 if_stmt
     : IF expression block else_part_opt
@@ -323,12 +437,31 @@ else_part_opt
         { $$ = null; }
     ;
 
+/*
+  ============================================================
+  FOR
+  ============================================================
+  Separamos las 3 formas para evitar conflictos.
+*/
+
 for_stmt
+    : for_range_stmt
+        { $$ = $1; }
+    | for_classic_stmt
+        { $$ = $1; }
+    | for_condition_stmt
+        { $$ = $1; }
+    ;
+
+for_condition_stmt
     : FOR expression block
         {
           $$ = createNode('ForStatement', 'condition', @1, [$2, $3]);
         }
-    | FOR for_init_opt ';' for_condition_opt ';' for_update_opt block
+    ;
+
+for_classic_stmt
+    : FOR for_init_opt ';' for_condition_opt ';' for_update_opt block
         {
           var initNode = $2 ? $2 : createNode('Empty', null, @1, []);
           var conditionNode = $4 ? $4 : createNode('Empty', null, @1, []);
@@ -341,6 +474,75 @@ for_stmt
           ]);
         }
     ;
+
+/*
+  range_iterable NO usa postfix_expression completo para evitar
+  que "range numeros {" choque con struct literals tipo:
+    numeros { ... }
+*/
+for_range_stmt
+    : FOR IDENTIFIER ',' IDENTIFIER DECLARE RANGE range_iterable block
+        {
+          $$ = createNode('ForRangeStatement', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            createNode('Identifier', $4, @4, []),
+            $7,
+            $8
+          ]);
+        }
+    ;
+
+range_iterable
+    : IDENTIFIER
+        {
+          $$ = createNode('Identifier', $1, @1, []);
+        }
+    | range_iterable '[' expression ']'
+        {
+          $$ = createNode('ArrayAccess', null, @2, [$1, $3]);
+        }
+    | range_iterable '.' IDENTIFIER
+        {
+          $$ = createNode('FieldAccess', $3, @2, [$1]);
+        }
+    ;
+
+for_init_opt
+    : var_decl
+        { $$ = $1; }
+    | typed_decl
+        { $$ = $1; }
+    | short_decl
+        { $$ = $1; }
+    | assignment
+        { $$ = $1; }
+    |
+        { $$ = null; }
+    ;
+
+for_condition_opt
+    : expression
+        { $$ = $1; }
+    |
+        { $$ = null; }
+    ;
+
+for_update_opt
+    : assignment
+        { $$ = $1; }
+    | inc_stmt
+        { $$ = $1; }
+    | dec_stmt
+        { $$ = $1; }
+    |
+        { $$ = null; }
+    ;
+
+/*
+  ============================================================
+  SWITCH
+  ============================================================
+*/
 
 switch_stmt
     : SWITCH expression '{' case_clause_list_opt default_clause_opt '}'
@@ -398,52 +600,11 @@ case_stmt_list
         { $$ = []; }
     ;
 
-for_init_opt
-    : var_decl
-        { $$ = $1; }
-    | short_decl
-        { $$ = $1; }
-    | assignment
-        { $$ = $1; }
-    |
-        { $$ = null; }
-    ;
-
-for_condition_opt
-    : expression
-        { $$ = $1; }
-    |
-        { $$ = null; }
-    ;
-
-for_update_opt
-    : assignment
-        { $$ = $1; }
-    | inc_stmt
-        { $$ = $1; }
-    | dec_stmt
-        { $$ = $1; }
-    |
-        { $$ = null; }
-    ;
-
-inc_stmt
-    : IDENTIFIER INC
-        {
-          $$ = createNode('IncStatement', null, @1, [
-            createNode('Identifier', $1, @1, [])
-          ]);
-        }
-    ;
-
-dec_stmt
-    : IDENTIFIER DEC
-        {
-          $$ = createNode('DecStatement', null, @1, [
-            createNode('Identifier', $1, @1, [])
-          ]);
-        }
-    ;
+/*
+  ============================================================
+  BREAK / CONTINUE / RETURN
+  ============================================================
+*/
 
 break_stmt
     : BREAK
@@ -477,13 +638,19 @@ return_expr_opt
         { $$ = null; }
     ;
 
+/*
+  ============================================================
+  DECLARACIONES
+  ============================================================
+*/
+
 var_decl
-    : VAR IDENTIFIER declared_type '=' expression
+    : VAR IDENTIFIER declared_type '=' initializer
         {
           $$ = createNode('VarDeclaration', null, @1, [
             createNode('Identifier', $2, @2, []),
             $3,
-            $5
+            adaptInitializerForTypedDeclaration($3, $5, @5)
           ]);
         }
     | VAR IDENTIFIER declared_type
@@ -492,6 +659,141 @@ var_decl
             createNode('Identifier', $2, @2, []),
             $3
           ]);
+        }
+    ;
+
+typed_decl
+    : type_spec IDENTIFIER '=' initializer
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1,
+            adaptInitializerForTypedDeclaration($1, $4, @4)
+          ]);
+        }
+    | type_spec IDENTIFIER
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1
+          ]);
+        }
+    | array_type IDENTIFIER '=' initializer
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1,
+            adaptInitializerForTypedDeclaration($1, $4, @4)
+          ]);
+        }
+    | array_type IDENTIFIER
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1
+          ]);
+        }
+    | slice_type IDENTIFIER '=' initializer
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1,
+            adaptInitializerForTypedDeclaration($1, $4, @4)
+          ]);
+        }
+    | slice_type IDENTIFIER
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            $1
+          ]);
+        }
+    ;
+
+identifier_statement
+    : IDENTIFIER DECLARE expression
+        {
+          $$ = createNode('ShortDeclaration', null, @1, [
+            createNode('Identifier', $1, @1, []),
+            $3
+          ]);
+        }
+    | IDENTIFIER INC
+        {
+          $$ = createNode('IncStatement', null, @1, [
+            createNode('Identifier', $1, @1, [])
+          ]);
+        }
+    | IDENTIFIER DEC
+        {
+          $$ = createNode('DecStatement', null, @1, [
+            createNode('Identifier', $1, @1, [])
+          ]);
+        }
+    | IDENTIFIER '(' expr_list_opt ')'
+        {
+          $$ = createNode('ExpressionStatement', null, @1, [
+            createNode('CallExpression', $1, @1, $3)
+          ]);
+        }
+    | IDENTIFIER '=' expression
+        {
+          $$ = createNode('Assignment', null, @2, [
+            createNode('Identifier', $1, @1, []),
+            $3
+          ]);
+        }
+    | IDENTIFIER postfix_ops '=' expression
+        {
+          $$ = createNode('Assignment', null, @3, [
+            applyPostfixOps(
+              createNode('Identifier', $1, @1, []),
+              $2
+            ),
+            $4
+          ]);
+        }
+    | IDENTIFIER IDENTIFIER '=' initializer
+        {
+          var declaredNamedType = createNode('NamedType', $1, @1, []);
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            declaredNamedType,
+            adaptInitializerForTypedDeclaration(declaredNamedType, $4, @4)
+          ]);
+        }
+    | IDENTIFIER IDENTIFIER
+        {
+          $$ = createNode('VarDeclaration', null, @1, [
+            createNode('Identifier', $2, @2, []),
+            createNode('NamedType', $1, @1, [])
+          ]);
+        }
+    ;
+
+postfix_ops
+    : postfix_ops postfix_op
+        { $$ = $1.concat([$2]); }
+    | postfix_op
+        { $$ = [$1]; }
+    ;
+
+postfix_op
+    : '[' expression ']'
+        {
+          $$ = {
+            kind: 'index',
+            expr: $2,
+            loc: @1
+          };
+        }
+    | '.' IDENTIFIER
+        {
+          $$ = {
+            kind: 'field',
+            name: $2,
+            loc: @1
+          };
         }
     ;
 
@@ -506,40 +808,69 @@ short_decl
     ;
 
 assignment
-    : IDENTIFIER '=' expression
+    : assignable '=' expression
         {
-          $$ = createNode('Assignment', null, @1, [
-            createNode('Identifier', $1, @1, []),
-            $3
+          $$ = createNode('Assignment', null, @2, [$1, $3]);
+        }
+    ;
+
+inc_stmt
+    : IDENTIFIER INC
+        {
+          $$ = createNode('IncStatement', null, @1, [
+            createNode('Identifier', $1, @1, [])
           ]);
         }
     ;
 
-array_assignment
-    : IDENTIFIER '[' expression ']' '=' expression
+dec_stmt
+    : IDENTIFIER DEC
         {
-          $$ = createNode('ArrayAssignment', null, @1, [
-            createNode('Identifier', $1, @1, []),
-            $3,
-            $6
+          $$ = createNode('DecStatement', null, @1, [
+            createNode('Identifier', $1, @1, [])
           ]);
         }
     ;
 
-field_assignment
-    : IDENTIFIER '.' IDENTIFIER '=' expression
+initializer
+    : expression
+        { $$ = $1; }
+    | anonymous_struct_literal
+        { $$ = $1; }
+    ;
+
+anonymous_struct_literal
+    : '{' struct_init_seq_opt '}'
         {
-          $$ = createNode('FieldAssignment', $3, @1, [
-            createNode('Identifier', $1, @1, []),
-            $5
-          ]);
+          $$ = createNode('AnonymousStructLiteral', null, @1, $2);
         }
     ;
+
+assignable
+    : IDENTIFIER
+        { $$ = createNode('Identifier', $1, @1, []); }
+    | assignable '[' expression ']'
+        {
+          $$ = createNode('ArrayAccess', null, @2, [$1, $3]);
+        }
+    | assignable '.' IDENTIFIER
+        {
+          $$ = createNode('FieldAccess', $3, @2, [$1]);
+        }
+    ;
+
+/*
+  ============================================================
+  TIPOS
+  ============================================================
+*/
 
 declared_type
     : type_spec
         { $$ = $1; }
     | array_type
+        { $$ = $1; }
+    | slice_type
         { $$ = $1; }
     | named_type
         { $$ = $1; }
@@ -553,10 +884,39 @@ named_type
     ;
 
 array_type
-    : '[' INT ']' type_spec
+    : '[' INT ']' array_element_type
         {
           $$ = createNode('ArrayType', $2, @1, [$4]);
         }
+    ;
+
+array_element_type
+    : type_spec
+        { $$ = $1; }
+    | named_type
+        { $$ = $1; }
+    | slice_type
+        { $$ = $1; }
+    | array_type
+        { $$ = $1; }
+    ;
+
+slice_type
+    : '[' ']' slice_element_type
+        {
+          $$ = createNode('SliceType', null, @1, [$3]);
+        }
+    ;
+
+slice_element_type
+    : type_spec
+        { $$ = $1; }
+    | named_type
+        { $$ = $1; }
+    | array_type
+        { $$ = $1; }
+    | slice_type
+        { $$ = $1; }
     ;
 
 type_spec
@@ -572,11 +932,24 @@ type_spec
         { $$ = createNode('Type', 'rune', @1, []); }
     ;
 
+/*
+  ============================================================
+  LISTAS CON COMA FINAL OPCIONAL
+  ============================================================
+*/
+
 expr_list_opt
-    : expr_list
+    : expr_list_maybe_trailing
         { $$ = $1; }
     |
         { $$ = []; }
+    ;
+
+expr_list_maybe_trailing
+    : expr_list
+        { $$ = $1; }
+    | expr_list ','
+        { $$ = $1; }
     ;
 
 expr_list
@@ -586,52 +959,18 @@ expr_list
         { $$ = [$1]; }
     ;
 
-call_expr
-    : IDENTIFIER '(' expr_list_opt ')'
-        {
-          $$ = createNode('CallExpression', $1, @1, $3);
-        }
-    ;
-
-array_access
-    : IDENTIFIER '[' expression ']'
-        {
-          $$ = createNode('ArrayAccess', null, @1, [
-            createNode('Identifier', $1, @1, []),
-            $3
-          ]);
-        }
-    ;
-
-field_access
-    : IDENTIFIER '.' IDENTIFIER
-        {
-          $$ = createNode('FieldAccess', $3, @1, [
-            createNode('Identifier', $1, @1, [])
-          ]);
-        }
-    ;
-
-array_literal
-    : '[' INT ']' type_spec '{' expr_list_opt '}'
-        {
-          var children = [$4].concat($6);
-          $$ = createNode('ArrayLiteral', $2, @1, children);
-        }
-    ;
-
-struct_literal
-    : IDENTIFIER '{' struct_init_list_opt '}'
-        {
-          $$ = createNode('StructLiteral', $1, @1, $3);
-        }
-    ;
-
-struct_init_list_opt
-    : struct_init_list
+struct_init_seq_opt
+    : struct_init_list_maybe_trailing
         { $$ = $1; }
     |
         { $$ = []; }
+    ;
+
+struct_init_list_maybe_trailing
+    : struct_init_list
+        { $$ = $1; }
+    | struct_init_list ','
+        { $$ = $1; }
     ;
 
 struct_init_list
@@ -641,12 +980,147 @@ struct_init_list
         { $$ = [$1]; }
     ;
 
+slice_item_seq_opt
+    : slice_item_list_maybe_trailing
+        { $$ = $1; }
+    |
+        { $$ = []; }
+    ;
+
+slice_item_list_maybe_trailing
+    : slice_item_list
+        { $$ = $1; }
+    | slice_item_list ','
+        { $$ = $1; }
+    ;
+
+slice_item_list
+    : slice_item_list ',' slice_item
+        { $$ = $1.concat([$3]); }
+    | slice_item
+        { $$ = [$1]; }
+    ;
+
+/*
+  ============================================================
+  LLAMADAS Y LITERALES
+  ============================================================
+*/
+
+call_expr
+    : IDENTIFIER '(' expr_list_opt ')'
+        {
+          $$ = createNode('CallExpression', $1, @1, $3);
+        }
+    ;
+
+/*
+  Array literal:
+    [3]int{1,2,3}
+*/
+array_literal
+    : '[' INT ']' array_element_type '{' expr_list_opt '}'
+        {
+          var children = [$4].concat($6);
+          $$ = createNode('ArrayLiteral', $2, @1, children);
+        }
+    ;
+
+/*
+  Slice literal:
+    []int{1,2,3}
+
+  Slice multidimensional:
+    [][]int{
+      {1,2,3},
+      {4,5,6},
+    }
+*/
+slice_literal
+    : '[' ']' slice_element_type '{' slice_item_seq_opt '}'
+        {
+          var children = [$3].concat($5);
+          $$ = createNode('SliceLiteral', null, @1, children);
+        }
+    ;
+
+slice_item
+    : expression
+        { $$ = $1; }
+    | anonymous_slice_literal
+        { $$ = $1; }
+    ;
+
+/*
+  Filas internas tipo:
+    {1,2,3}
+*/
+anonymous_slice_literal
+    : '{' slice_item_seq_opt '}'
+        {
+          $$ = createNode('AnonymousSliceLiteral', null, @1, $2);
+        }
+    ;
+
+/*
+  Struct literal:
+    Persona{nombre: "Ana", edad: 20}
+*/
+struct_literal
+    : IDENTIFIER '{' struct_init_seq_opt '}'
+        {
+          $$ = createNode('StructLiteral', $1, @1, $3);
+        }
+    ;
+
 struct_init
     : IDENTIFIER ':' expression
         {
           $$ = createNode('StructInit', $1, @1, [$3]);
         }
     ;
+
+/*
+  ============================================================
+  PRIMARIAS Y POSTFIX
+  ============================================================
+*/
+
+primary_expression
+    : call_expr
+        { $$ = $1; }
+    | array_literal
+        { $$ = $1; }
+    | slice_literal
+        { $$ = $1; }
+    | struct_literal
+        { $$ = $1; }
+    | literal
+        { $$ = $1; }
+    | IDENTIFIER
+        { $$ = createNode('Identifier', $1, @1, []); }
+    | '(' expression ')'
+        { $$ = $2; }
+    ;
+
+postfix_expression
+    : primary_expression
+        { $$ = $1; }
+    | postfix_expression '[' expression ']'
+        {
+          $$ = createNode('ArrayAccess', null, @2, [$1, $3]);
+        }
+    | postfix_expression '.' IDENTIFIER
+        {
+          $$ = createNode('FieldAccess', $3, @2, [$1]);
+        }
+    ;
+
+/*
+  ============================================================
+  EXPRESIONES
+  ============================================================
+*/
 
 expression
     : expression OR expression
@@ -679,22 +1153,8 @@ expression
         { $$ = createNode('UnaryExpression', '!', @1, [$2]); }
     | '-' expression %prec UMINUS
         { $$ = createNode('UnaryExpression', '-', @1, [$2]); }
-    | '(' expression ')'
-        { $$ = $2; }
-    | call_expr
+    | postfix_expression
         { $$ = $1; }
-    | array_access
-        { $$ = $1; }
-    | field_access
-        { $$ = $1; }
-    | array_literal
-        { $$ = $1; }
-    | struct_literal
-        { $$ = $1; }
-    | literal
-        { $$ = $1; }
-    | IDENTIFIER
-        { $$ = createNode('Identifier', $1, @1, []); }
     ;
 
 literal

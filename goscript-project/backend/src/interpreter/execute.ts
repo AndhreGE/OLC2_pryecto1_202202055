@@ -4,14 +4,14 @@ import { astToDot } from "../reports/astToDot";
 import type { CompilerError, ExecutionResult, SymbolEntry } from "../shared/types";
 
 type PrimitiveType = "int" | "float64" | "string" | "bool" | "rune";
-type RuntimeType = PrimitiveType | "array" | "struct";
-type NonVoidTypeName = PrimitiveType | string;
+type RuntimeType = PrimitiveType | "array" | "slice" | "struct";
+type NonVoidTypeName = string;
 type ReturnTypeName = NonVoidTypeName | "void";
 
 interface RuntimeValue {
   dataType: RuntimeType;
   value: number | string | boolean | RuntimeValue[] | Record<string, RuntimeValue>;
-  elementType?: PrimitiveType;
+  elementType?: NonVoidTypeName;
   size?: number;
   structName?: string;
 }
@@ -45,7 +45,7 @@ interface FunctionInfo {
 
 interface StructFieldInfo {
   name: string;
-  dataType: PrimitiveType;
+  typeName: NonVoidTypeName;
   line: number;
   column: number;
 }
@@ -67,7 +67,18 @@ interface RuntimeContext {
   callCounter: number;
 }
 
+interface AssignableReference {
+  currentValue: RuntimeValue;
+  setValue: (nextValue: RuntimeValue) => void;
+}
+
 type StatementResult = FlowSignal | null;
+
+/*
+  ============================================================
+  PARSEO DE TIPOS TEXTUALES
+  ============================================================
+*/
 
 function isPrimitiveTypeName(typeName: string): typeName is PrimitiveType {
   return (
@@ -78,6 +89,51 @@ function isPrimitiveTypeName(typeName: string): typeName is PrimitiveType {
     typeName === "rune"
   );
 }
+
+function parseSliceTypeText(typeName: string): { elementType: string } | null {
+  if (!typeName.startsWith("[]")) {
+    return null;
+  }
+
+  return {
+    elementType: typeName.slice(2)
+  };
+}
+
+function parseArrayTypeText(typeName: string): { size: number; elementType: string } | null {
+  const match = typeName.match(/^\[(\d+)\](.+)$/);
+
+  if (!match) {
+    return null;
+  }
+
+  return {
+    size: Number(match[1]),
+    elementType: match[2]
+  };
+}
+
+function typeStringFromTypeNode(typeNode: AstNode | undefined): string {
+  if (!typeNode) {
+    return "int";
+  }
+
+  if (typeNode.kind === "ArrayType") {
+    return `[${typeNode.value ?? "0"}]${typeStringFromTypeNode(typeNode.children[0])}`;
+  }
+
+  if (typeNode.kind === "SliceType") {
+    return `[]${typeStringFromTypeNode(typeNode.children[0])}`;
+  }
+
+  return typeNode.value ?? "int";
+}
+
+/*
+  ============================================================
+  SCOPES Y TABLA DE SÍMBOLOS
+  ============================================================
+*/
 
 function createScope(name: string, parent: ScopeFrame | null): ScopeFrame {
   return {
@@ -106,8 +162,18 @@ function registerSymbol(
   });
 }
 
+/*
+  ============================================================
+  RUNTIME VALUES
+  ============================================================
+*/
+
 function isArrayValue(value: RuntimeValue): boolean {
   return value.dataType === "array";
+}
+
+function isSliceValue(value: RuntimeValue): boolean {
+  return value.dataType === "slice";
 }
 
 function isStructValue(value: RuntimeValue): boolean {
@@ -135,7 +201,7 @@ function makeRune(value: string): RuntimeValue {
 }
 
 function makeArray(
-  elementType: PrimitiveType,
+  elementType: NonVoidTypeName,
   size: number,
   elements: RuntimeValue[]
 ): RuntimeValue {
@@ -144,6 +210,17 @@ function makeArray(
     value: elements,
     elementType,
     size
+  };
+}
+
+function makeSlice(
+  elementType: NonVoidTypeName,
+  elements: RuntimeValue[]
+): RuntimeValue {
+  return {
+    dataType: "slice",
+    value: elements,
+    elementType
   };
 }
 
@@ -176,7 +253,12 @@ function defaultValueForPrimitive(dataType: PrimitiveType): RuntimeValue {
 function cloneValue(value: RuntimeValue): RuntimeValue {
   if (isArrayValue(value)) {
     const clonedElements = (value.value as RuntimeValue[]).map((item) => cloneValue(item));
-    return makeArray(value.elementType as PrimitiveType, value.size as number, clonedElements);
+    return makeArray(value.elementType as NonVoidTypeName, value.size as number, clonedElements);
+  }
+
+  if (isSliceValue(value)) {
+    const clonedElements = (value.value as RuntimeValue[]).map((item) => cloneValue(item));
+    return makeSlice(value.elementType as NonVoidTypeName, clonedElements);
   }
 
   if (isStructValue(value)) {
@@ -196,9 +278,26 @@ function cloneValue(value: RuntimeValue): RuntimeValue {
   };
 }
 
+/*
+  Para lecturas en expresiones:
+  - slices y structs se comportan como referencia
+  - arrays y primitivos se clonan
+*/
+function valueForRead(value: RuntimeValue): RuntimeValue {
+  if (isSliceValue(value) || isStructValue(value)) {
+    return value;
+  }
+
+  return cloneValue(value);
+}
+
 function typeStringFromValue(value: RuntimeValue): string {
   if (isArrayValue(value)) {
     return `[${value.size}]${value.elementType}`;
+  }
+
+  if (isSliceValue(value)) {
+    return `[]${value.elementType}`;
   }
 
   if (isStructValue(value)) {
@@ -208,18 +307,11 @@ function typeStringFromValue(value: RuntimeValue): string {
   return value.dataType;
 }
 
-function typeStringFromTypeNode(typeNode: AstNode): string {
-  if (typeNode.kind === "ArrayType") {
-    const elementTypeNode = typeNode.children[0];
-    return `[${typeNode.value ?? "0"}]${elementTypeNode?.value ?? "int"}`;
-  }
-
-  if (typeNode.kind === "NamedType") {
-    return typeNode.value ?? "struct";
-  }
-
-  return typeNode.value ?? "int";
-}
+/*
+  ============================================================
+  VALORES POR DEFECTO
+  ============================================================
+*/
 
 function createDefaultStructValue(
   structName: string,
@@ -241,34 +333,16 @@ function createDefaultStructValue(
   const fields: Record<string, RuntimeValue> = {};
 
   for (const field of structInfo.fields) {
-    fields[field.name] = defaultValueForPrimitive(field.dataType);
+    const defaultFieldValue = defaultValueForTypeName(field.typeName, context, node);
+
+    if (!defaultFieldValue) {
+      return null;
+    }
+
+    fields[field.name] = defaultFieldValue;
   }
 
   return makeStruct(structName, fields);
-}
-
-function defaultValueFromTypeNode(
-  typeNode: AstNode,
-  context: RuntimeContext
-): RuntimeValue | null {
-  if (typeNode.kind === "ArrayType") {
-    const size = Number(typeNode.value ?? "0");
-    const elementTypeNode = typeNode.children[0];
-    const elementType = (elementTypeNode?.value ?? "int") as PrimitiveType;
-    const elements: RuntimeValue[] = [];
-
-    for (let i = 0; i < size; i++) {
-      elements.push(defaultValueForPrimitive(elementType));
-    }
-
-    return makeArray(elementType, size, elements);
-  }
-
-  if (typeNode.kind === "NamedType") {
-    return createDefaultStructValue(typeNode.value ?? "", context, typeNode);
-  }
-
-  return defaultValueForPrimitive((typeNode.value ?? "int") as PrimitiveType);
 }
 
 function defaultValueForTypeName(
@@ -280,8 +354,43 @@ function defaultValueForTypeName(
     return defaultValueForPrimitive(typeName);
   }
 
+  const sliceInfo = parseSliceTypeText(typeName);
+  if (sliceInfo) {
+    return makeSlice(sliceInfo.elementType, []);
+  }
+
+  const arrayInfo = parseArrayTypeText(typeName);
+  if (arrayInfo) {
+    const elements: RuntimeValue[] = [];
+
+    for (let i = 0; i < arrayInfo.size; i++) {
+      const item = defaultValueForTypeName(arrayInfo.elementType, context, node);
+
+      if (!item) {
+        return null;
+      }
+
+      elements.push(item);
+    }
+
+    return makeArray(arrayInfo.elementType, arrayInfo.size, elements);
+  }
+
   return createDefaultStructValue(typeName, context, node);
 }
+
+function defaultValueFromTypeNode(
+  typeNode: AstNode,
+  context: RuntimeContext
+): RuntimeValue | null {
+  return defaultValueForTypeName(typeStringFromTypeNode(typeNode), context, typeNode);
+}
+
+/*
+  ============================================================
+  BÚSQUEDA DE VARIABLES Y ERRORES
+  ============================================================
+*/
 
 function findVariableFrame(scope: ScopeFrame, name: string): ScopeFrame | null {
   let current: ScopeFrame | null = scope;
@@ -322,6 +431,12 @@ function pushSemanticError(
   return makeInt(0);
 }
 
+/*
+  ============================================================
+  CONVERSIONES Y FORMATEO
+  ============================================================
+*/
+
 function runeToCode(value: string): number {
   if (value.length === 0) {
     return 0;
@@ -339,7 +454,7 @@ function formatFloat(value: number): string {
 }
 
 function formatValueForPrint(value: RuntimeValue): string {
-  if (isArrayValue(value)) {
+  if (isArrayValue(value) || isSliceValue(value)) {
     const elements = (value.value as RuntimeValue[]).map((item) => formatValueForPrint(item));
     return `[${elements.join(", ")}]`;
   }
@@ -372,7 +487,7 @@ function toIntLikeNumber(
   context: RuntimeContext,
   operator: string
 ): number | null {
-  if (isArrayValue(value) || isStructValue(value)) {
+  if (isArrayValue(value) || isSliceValue(value) || isStructValue(value)) {
     context.errors.push({
       type: "Semantico",
       description: `La operación "${operator}" no acepta valores de tipo ${typeStringFromValue(value)}.`,
@@ -406,7 +521,7 @@ function toFloatCompatibleNumber(
   context: RuntimeContext,
   operator: string
 ): number | null {
-  if (isArrayValue(value) || isStructValue(value)) {
+  if (isArrayValue(value) || isSliceValue(value) || isStructValue(value)) {
     context.errors.push({
       type: "Semantico",
       description: `La operación "${operator}" no acepta valores de tipo ${typeStringFromValue(value)}.`,
@@ -434,174 +549,6 @@ function toFloatCompatibleNumber(
       });
       return null;
   }
-}
-
-function coercePrimitiveValue(
-  expectedType: PrimitiveType,
-  value: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue | null {
-  if (isArrayValue(value) || isStructValue(value)) {
-    context.errors.push({
-      type: "Semantico",
-      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
-      line: node.line,
-      column: node.column
-    });
-    return null;
-  }
-
-  if (expectedType === value.dataType) {
-    return cloneValue(value);
-  }
-
-  if (expectedType === "float64" && value.dataType === "int") {
-    return makeFloat(Number(value.value));
-  }
-
-  context.errors.push({
-    type: "Semantico",
-    description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
-    line: node.line,
-    column: node.column
-  });
-
-  return null;
-}
-
-function coerceValueToTypeName(
-  expectedType: NonVoidTypeName,
-  value: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue | null {
-  if (isPrimitiveTypeName(expectedType)) {
-    return coercePrimitiveValue(expectedType, value, node, context);
-  }
-
-  if (!isStructValue(value)) {
-    context.errors.push({
-      type: "Semantico",
-      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
-      line: node.line,
-      column: node.column
-    });
-    return null;
-  }
-
-  if (value.structName !== expectedType) {
-    context.errors.push({
-      type: "Semantico",
-      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
-      line: node.line,
-      column: node.column
-    });
-    return null;
-  }
-
-  return cloneValue(value);
-}
-
-function coerceValueToTypeNode(
-  typeNode: AstNode,
-  value: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue | null {
-  if (typeNode.kind === "ArrayType") {
-    const size = Number(typeNode.value ?? "0");
-    const elementTypeNode = typeNode.children[0];
-    const elementType = (elementTypeNode?.value ?? "int") as PrimitiveType;
-
-    if (!isArrayValue(value)) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo [${size}]${elementType}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    if (value.size !== size || value.elementType !== elementType) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo [${size}]${elementType}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    return cloneValue(value);
-  }
-
-  if (typeNode.kind === "NamedType") {
-    return coerceValueToTypeName(typeNode.value ?? "", value, node, context);
-  }
-
-  return coercePrimitiveValue((typeNode.value ?? "int") as PrimitiveType, value, node, context);
-}
-
-function coerceValueToExistingValue(
-  currentValue: RuntimeValue,
-  newValue: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue | null {
-  if (isArrayValue(currentValue)) {
-    if (!isArrayValue(newValue)) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(newValue)} a una variable de tipo ${typeStringFromValue(currentValue)}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    if (
-      currentValue.size !== newValue.size ||
-      currentValue.elementType !== newValue.elementType
-    ) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(newValue)} a una variable de tipo ${typeStringFromValue(currentValue)}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    return cloneValue(newValue);
-  }
-
-  if (isStructValue(currentValue)) {
-    if (!isStructValue(newValue)) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(newValue)} a una variable de tipo ${typeStringFromValue(currentValue)}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    if (currentValue.structName !== newValue.structName) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(newValue)} a una variable de tipo ${typeStringFromValue(currentValue)}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
-
-    return cloneValue(newValue);
-  }
-
-  return coercePrimitiveValue(currentValue.dataType as PrimitiveType, newValue, node, context);
 }
 
 function expectBoolean(
@@ -648,7 +595,14 @@ function areEqualValues(
   node: AstNode,
   context: RuntimeContext
 ): boolean | null {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
     context.errors.push({
       type: "Semantico",
       description: `No se puede comparar ${typeStringFromValue(left)} con ${typeStringFromValue(right)} usando "==".`,
@@ -689,7 +643,7 @@ function areEqualValues(
   return null;
 }
 
-function getArrayIndex(
+function getIndexedPosition(
   value: RuntimeValue,
   node: AstNode,
   context: RuntimeContext
@@ -697,7 +651,7 @@ function getArrayIndex(
   if (value.dataType !== "int") {
     context.errors.push({
       type: "Semantico",
-      description: "El índice de un arreglo debe ser int.",
+      description: "El índice debe ser int.",
       line: node.line,
       column: node.column
     });
@@ -706,6 +660,134 @@ function getArrayIndex(
 
   return Number(value.value);
 }
+
+/*
+  ============================================================
+  COERCIÓN DE TIPOS
+  ============================================================
+*/
+
+function coercePrimitiveValue(
+  expectedType: PrimitiveType,
+  value: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue | null {
+  if (isArrayValue(value) || isSliceValue(value) || isStructValue(value)) {
+    context.errors.push({
+      type: "Semantico",
+      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+      line: node.line,
+      column: node.column
+    });
+    return null;
+  }
+
+  if (expectedType === value.dataType) {
+    return cloneValue(value);
+  }
+
+  if (expectedType === "float64" && value.dataType === "int") {
+    return makeFloat(Number(value.value));
+  }
+
+  context.errors.push({
+    type: "Semantico",
+    description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+    line: node.line,
+    column: node.column
+  });
+
+  return null;
+}
+
+/*
+  Regla importante:
+  - primitives: por valor
+  - arrays: por valor
+  - slices: por referencia
+  - structs: por referencia
+*/
+function coerceValueToTypeName(
+  expectedType: NonVoidTypeName,
+  value: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue | null {
+  if (isPrimitiveTypeName(expectedType)) {
+    return coercePrimitiveValue(expectedType, value, node, context);
+  }
+
+  const sliceInfo = parseSliceTypeText(expectedType);
+  if (sliceInfo) {
+    if (!isSliceValue(value) || value.elementType !== sliceInfo.elementType) {
+      context.errors.push({
+        type: "Semantico",
+        description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+        line: node.line,
+        column: node.column
+      });
+      return null;
+    }
+
+    return value;
+  }
+
+  const arrayInfo = parseArrayTypeText(expectedType);
+  if (arrayInfo) {
+    if (
+      !isArrayValue(value) ||
+      value.size !== arrayInfo.size ||
+      value.elementType !== arrayInfo.elementType
+    ) {
+      context.errors.push({
+        type: "Semantico",
+        description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+        line: node.line,
+        column: node.column
+      });
+      return null;
+    }
+
+    return cloneValue(value);
+  }
+
+  if (!isStructValue(value) || value.structName !== expectedType) {
+    context.errors.push({
+      type: "Semantico",
+      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+      line: node.line,
+      column: node.column
+    });
+    return null;
+  }
+
+  return value;
+}
+
+function coerceValueToTypeNode(
+  typeNode: AstNode,
+  value: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue | null {
+  return coerceValueToTypeName(typeStringFromTypeNode(typeNode), value, node, context);
+}
+
+function coerceValueToExistingValue(
+  currentValue: RuntimeValue,
+  newValue: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue | null {
+  return coerceValueToTypeName(typeStringFromValue(currentValue), newValue, node, context);
+}
+
+/*
+  ============================================================
+  STRUCTS
+  ============================================================
+*/
 
 function extractStructInfo(
   node: AstNode,
@@ -745,7 +827,7 @@ function extractStructInfo(
 
     const info: StructFieldInfo = {
       name: fieldName,
-      dataType: (typeNode.value ?? "int") as PrimitiveType,
+      typeName: typeStringFromTypeNode(typeNode),
       line: child.line,
       column: child.column
     };
@@ -762,362 +844,811 @@ function extractStructInfo(
   };
 }
 
-function evaluateAddition(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  node: AstNode,
+/*
+  ============================================================
+  EVALUADORES DE LITERALES DE COLECCIONES
+  ============================================================
+*/
+
+/*
+  Evalúa una expresión esperando un tipo específico.
+  Esto es clave para soportar filas anónimas en:
+    [][]int{
+      {1,2,3},
+      {4,5,6}
+    }
+*/
+function evaluateValueForExpectedType(
+  expectedType: NonVoidTypeName,
+  exprNode: AstNode,
+  scope: ScopeFrame,
   context: RuntimeContext
 ): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "+" no es válida con arreglos o structs.'
-    );
-  }
+  if (exprNode.kind === "AnonymousSliceLiteral") {
+    const sliceInfo = parseSliceTypeText(expectedType);
 
-  if (left.dataType === "string" || right.dataType === "string") {
-    return makeString(`${formatValueForPrint(left)}${formatValueForPrint(right)}`);
-  }
-
-  if (left.dataType === "float64" || right.dataType === "float64") {
-    const l = toFloatCompatibleNumber(left, node, context, "+");
-    const r = toFloatCompatibleNumber(right, node, context, "+");
-
-    if (l === null || r === null) {
-      return makeInt(0);
+    if (sliceInfo) {
+      return evaluateAnonymousSliceLiteral(exprNode, sliceInfo.elementType, scope, context);
     }
 
-    return makeFloat(l + r);
-  }
+    const arrayInfo = parseArrayTypeText(expectedType);
 
-  if (left.dataType === "bool" && right.dataType === "bool") {
-    return makeBool(Boolean(left.value) || Boolean(right.value));
-  }
-
-  const l = toIntLikeNumber(left, node, context, "+");
-  const r = toIntLikeNumber(right, node, context, "+");
-
-  if (l === null || r === null) {
-    return makeInt(0);
-  }
-
-  return makeInt(l + r);
-}
-
-function evaluateSubtraction(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "-" no es válida con arreglos o structs.'
-    );
-  }
-
-  if (left.dataType === "string" || right.dataType === "string") {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "-" no es válida con valores string.'
-    );
-  }
-
-  if (left.dataType === "float64" || right.dataType === "float64") {
-    const l = toFloatCompatibleNumber(left, node, context, "-");
-    const r = toFloatCompatibleNumber(right, node, context, "-");
-
-    if (l === null || r === null) {
-      return makeInt(0);
+    if (arrayInfo) {
+      return evaluateAnonymousArrayLiteral(exprNode, arrayInfo.size, arrayInfo.elementType, scope, context);
     }
 
-    return makeFloat(l - r);
-  }
-
-  if (left.dataType === "bool" && right.dataType === "bool") {
-    return makeInt(
-      boolToInt(Boolean(left.value)) - boolToInt(Boolean(right.value))
-    );
-  }
-
-  if (left.dataType === "bool" && right.dataType === "rune") {
-    return makeInt(
-      boolToInt(Boolean(left.value)) + runeToCode(String(right.value))
-    );
-  }
-
-  const l = toIntLikeNumber(left, node, context, "-");
-  const r = toIntLikeNumber(right, node, context, "-");
-
-  if (l === null || r === null) {
-    return makeInt(0);
-  }
-
-  return makeInt(l - r);
-}
-
-function evaluateMultiplication(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
     return pushSemanticError(
       context,
-      node,
-      'La operación "*" no es válida con arreglos o structs.'
+      exprNode,
+      `No se puede usar una colección anónima para inicializar un valor de tipo ${expectedType}.`
     );
   }
 
-  if (left.dataType === "int" && right.dataType === "string") {
-    const count = Math.trunc(Number(left.value));
+  return evaluateExpression(exprNode, scope, context);
+}
 
-    if (count < 0) {
-      return pushSemanticError(
-        context,
-        node,
-        "No se puede repetir una cadena una cantidad negativa de veces."
-      );
+function evaluateAnonymousSliceLiteral(
+  node: AstNode,
+  elementType: NonVoidTypeName,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const items: RuntimeValue[] = [];
+
+  for (const child of node.children) {
+    const rawValue = evaluateValueForExpectedType(elementType, child, scope, context);
+    const coerced = coerceValueToTypeName(elementType, rawValue, child, context);
+
+    if (coerced) {
+      items.push(coerced);
+    } else {
+      const fallback = defaultValueForTypeName(elementType, context, child);
+      items.push(fallback ?? makeInt(0));
     }
-
-    return makeString(String(right.value).repeat(count));
   }
 
-  if (left.dataType === "string" || right.dataType === "string") {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "*" solo permite repetición con int * string.'
-    );
+  return makeSlice(elementType, items);
+}
+
+function evaluateAnonymousArrayLiteral(
+  node: AstNode,
+  size: number,
+  elementType: NonVoidTypeName,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const items: RuntimeValue[] = [];
+
+  if (node.children.length > size) {
+    context.errors.push({
+      type: "Semantico",
+      description: `El arreglo de tamaño ${size} no puede recibir ${node.children.length} valor(es) iniciales.`,
+      line: node.line,
+      column: node.column
+    });
   }
 
-  if (left.dataType === "float64" || right.dataType === "float64") {
-    const l = toFloatCompatibleNumber(left, node, context, "*");
-    const r = toFloatCompatibleNumber(right, node, context, "*");
+  for (let i = 0; i < size; i++) {
+    if (i < node.children.length) {
+      const rawValue = evaluateValueForExpectedType(elementType, node.children[i], scope, context);
+      const coerced = coerceValueToTypeName(elementType, rawValue, node.children[i], context);
 
-    if (l === null || r === null) {
-      return makeInt(0);
+      if (coerced) {
+        items.push(coerced);
+      } else {
+        const fallback = defaultValueForTypeName(elementType, context, node.children[i]);
+        items.push(fallback ?? makeInt(0));
+      }
+    } else {
+      const fallback = defaultValueForTypeName(elementType, context, node);
+      items.push(fallback ?? makeInt(0));
     }
-
-    return makeFloat(l * r);
   }
 
-  if (left.dataType === "bool" && right.dataType === "bool") {
-    return makeBool(Boolean(left.value) && Boolean(right.value));
-  }
-
-  const l = toIntLikeNumber(left, node, context, "*");
-  const r = toIntLikeNumber(right, node, context, "*");
-
-  if (l === null || r === null) {
-    return makeInt(0);
-  }
-
-  return makeInt(l * r);
+  return makeArray(elementType, size, items);
 }
 
-function evaluateDivision(
-  left: RuntimeValue,
-  right: RuntimeValue,
+/*
+  ============================================================
+  BUILTINS
+  ============================================================
+*/
+
+function evaluateBuiltinLen(
   node: AstNode,
+  scope: ScopeFrame,
   context: RuntimeContext
 ): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
+  if (node.children.length !== 1) {
     return pushSemanticError(
       context,
       node,
-      'La operación "/" no es válida con arreglos o structs.'
+      'La función len espera exactamente 1 argumento.'
     );
   }
 
-  const leftAllowed = left.dataType === "int" || left.dataType === "float64";
-  const rightAllowed = right.dataType === "int" || right.dataType === "float64";
+  const target = evaluateExpression(node.children[0], scope, context);
 
-  if (!leftAllowed || !rightAllowed) {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "/" solo acepta valores int y float64.'
-    );
-  }
-
-  const l = Number(left.value);
-  const r = Number(right.value);
-
-  if (r === 0) {
-    return pushSemanticError(context, node, "No se puede dividir entre 0.");
-  }
-
-  if (left.dataType === "int" && right.dataType === "int") {
-    return makeInt(Math.trunc(l / r));
-  }
-
-  return makeFloat(l / r);
-}
-
-function evaluateModulo(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "%" no es válida con arreglos o structs.'
-    );
-  }
-
-  if (left.dataType !== "int" || right.dataType !== "int") {
-    return pushSemanticError(
-      context,
-      node,
-      'La operación "%" solo acepta valores int.'
-    );
-  }
-
-  const l = Number(left.value);
-  const r = Number(right.value);
-
-  if (r === 0) {
-    return pushSemanticError(context, node, "No se puede calcular módulo entre 0.");
-  }
-
-  return makeInt(l % r);
-}
-
-function evaluateUnaryMinus(
-  value: RuntimeValue,
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  if (isArrayValue(value) || isStructValue(value)) {
-    return pushSemanticError(
-      context,
-      node,
-      "La negación unaria no se aplica a arreglos o structs."
-    );
-  }
-
-  if (value.dataType === "int") {
-    return makeInt(-Number(value.value));
-  }
-
-  if (value.dataType === "float64") {
-    return makeFloat(-Number(value.value));
+  if (isSliceValue(target) || isArrayValue(target)) {
+    return makeInt((target.value as RuntimeValue[]).length);
   }
 
   return pushSemanticError(
     context,
     node,
-    "La negación unaria solo se aplica a int y float64."
+    `La función len no acepta valores de tipo ${typeStringFromValue(target)}.`
   );
 }
 
-function evaluateLogicalNot(
-  value: RuntimeValue,
+function evaluateBuiltinAppend(
   node: AstNode,
+  scope: ScopeFrame,
   context: RuntimeContext
 ): RuntimeValue {
-  const boolValue = expectBoolean(value, node, context, "!");
-
-  if (boolValue === null) {
-    return makeInt(0);
-  }
-
-  return makeBool(!boolValue);
-}
-
-function evaluateEqualityComparison(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  operator: "==" | "!=",
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  const result = areEqualValues(left, right, node, context);
-
-  if (result === null) {
-    return makeInt(0);
-  }
-
-  return makeBool(operator === "==" ? result : !result);
-}
-
-function evaluateRelationalComparison(
-  left: RuntimeValue,
-  right: RuntimeValue,
-  operator: ">" | "<" | ">=" | "<=",
-  node: AstNode,
-  context: RuntimeContext
-): RuntimeValue {
-  if (isArrayValue(left) || isArrayValue(right) || isStructValue(left) || isStructValue(right)) {
+  if (node.children.length !== 2) {
     return pushSemanticError(
       context,
       node,
-      `No se puede comparar ${typeStringFromValue(left)} con ${typeStringFromValue(right)} usando "${operator}".`
+      'La función append espera exactamente 2 argumentos.'
     );
   }
 
-  let result: boolean | null = null;
+  const sliceValue = evaluateExpression(node.children[0], scope, context);
 
-  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
-  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+  if (!isSliceValue(sliceValue)) {
+    return pushSemanticError(
+      context,
+      node,
+      `La función append solo acepta slices como primer argumento, pero recibió ${typeStringFromValue(sliceValue)}.`
+    );
+  }
 
-  if (leftNumeric && rightNumeric) {
-    const l = Number(left.value);
-    const r = Number(right.value);
+  const valueToAppend = evaluateExpression(node.children[1], scope, context);
+  const coerced = coerceValueToTypeName(
+    sliceValue.elementType as NonVoidTypeName,
+    valueToAppend,
+    node.children[1],
+    context
+  );
 
-    switch (operator) {
-      case ">":
-        result = l > r;
-        break;
-      case "<":
-        result = l < r;
-        break;
-      case ">=":
-        result = l >= r;
-        break;
-      case "<=":
-        result = l <= r;
-        break;
-    }
-  } else if (left.dataType === "rune" && right.dataType === "rune") {
-    const l = runeToCode(String(left.value));
-    const r = runeToCode(String(right.value));
+  if (!coerced) {
+    return makeSlice(sliceValue.elementType as NonVoidTypeName, [
+      ...(sliceValue.value as RuntimeValue[]).map((item) => item)
+    ]);
+  }
 
-    switch (operator) {
-      case ">":
-        result = l > r;
-        break;
-      case "<":
-        result = l < r;
-        break;
-      case ">=":
-        result = l >= r;
-        break;
-      case "<=":
-        result = l <= r;
-        break;
-    }
-  } else {
+  const clonedItems = [...(sliceValue.value as RuntimeValue[])];
+  clonedItems.push(coerced);
+
+  return makeSlice(sliceValue.elementType as NonVoidTypeName, clonedItems);
+}
+
+function evaluateCallExpression(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const functionName = node.value ?? "";
+
+  if (functionName === "len") {
+    return evaluateBuiltinLen(node, scope, context);
+  }
+
+  if (functionName === "append") {
+    return evaluateBuiltinAppend(node, scope, context);
+  }
+
+  const argValues = node.children.map((child) => evaluateExpression(child, scope, context));
+  const result = invokeFunction(functionName, argValues, node, context);
+
+  if (result === null) {
+    return pushSemanticError(
+      context,
+      node,
+      `La función "${functionName}" no retorna un valor utilizable en expresiones.`
+    );
+  }
+
+  return result;
+}
+
+/*
+  Esto corrige el caso:
+    mostrar(personas)
+  que es una llamada válida como sentencia, aunque no retorne nada.
+*/
+function executeCallStatement(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): void {
+  const functionName = node.value ?? "";
+
+  if (functionName === "len" || functionName === "append") {
+    evaluateCallExpression(node, scope, context);
+    return;
+  }
+
+  const argValues = node.children.map((child) => evaluateExpression(child, scope, context));
+  invokeFunction(functionName, argValues, node, context);
+}
+
+/*
+  ============================================================
+  LITERALES Y ACCESOS
+  ============================================================
+*/
+
+function evaluateArrayLiteral(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const size = Number(node.value ?? "0");
+  const typeNode = node.children[0];
+  const elementType = typeStringFromTypeNode(typeNode);
+  const providedExprs = node.children.slice(1);
+  const elements: RuntimeValue[] = [];
+
+  if (providedExprs.length > size) {
     context.errors.push({
       type: "Semantico",
-      description: `No se puede comparar ${typeStringFromValue(left)} con ${typeStringFromValue(right)} usando "${operator}".`,
+      description: `El arreglo de tamaño ${size} no puede recibir ${providedExprs.length} valor(es) iniciales.`,
       line: node.line,
       column: node.column
     });
+  }
+
+  for (let i = 0; i < size; i++) {
+    if (i < providedExprs.length) {
+      const rawValue = evaluateValueForExpectedType(elementType, providedExprs[i], scope, context);
+      const coerced = coerceValueToTypeName(elementType, rawValue, providedExprs[i], context);
+
+      if (coerced) {
+        elements.push(coerced);
+      } else {
+        const fallback = defaultValueForTypeName(elementType, context, providedExprs[i]);
+        elements.push(fallback ?? makeInt(0));
+      }
+    } else {
+      const fallback = defaultValueForTypeName(elementType, context, node);
+      elements.push(fallback ?? makeInt(0));
+    }
+  }
+
+  return makeArray(elementType, size, elements);
+}
+
+function evaluateSliceLiteral(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const typeNode = node.children[0];
+  const elementType = typeStringFromTypeNode(typeNode);
+  const exprNodes = node.children.slice(1);
+  const elements: RuntimeValue[] = [];
+
+  for (const exprNode of exprNodes) {
+    const rawValue = evaluateValueForExpectedType(elementType, exprNode, scope, context);
+    const coerced = coerceValueToTypeName(elementType, rawValue, exprNode, context);
+
+    if (coerced) {
+      elements.push(coerced);
+    } else {
+      const fallback = defaultValueForTypeName(elementType, context, exprNode);
+      elements.push(fallback ?? makeInt(0));
+    }
+  }
+
+  return makeSlice(elementType, elements);
+}
+
+function evaluateStructLiteral(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const structName = node.value ?? "";
+  const baseValue = createDefaultStructValue(structName, context, node);
+
+  if (!baseValue || !isStructValue(baseValue)) {
     return makeInt(0);
   }
 
-  return makeBool(Boolean(result));
+  const structInfo = context.structs.get(structName);
+  const fieldsObject = baseValue.value as Record<string, RuntimeValue>;
+  const seen = new Set<string>();
+
+  if (!structInfo) {
+    return makeInt(0);
+  }
+
+  for (const initNode of node.children) {
+    const fieldName = initNode.value ?? "";
+    const exprNode = initNode.children[0];
+    const fieldInfo = structInfo.fieldMap.get(fieldName);
+
+    if (!fieldInfo) {
+      context.errors.push({
+        type: "Semantico",
+        description: `El campo "${fieldName}" no existe en el struct "${structName}".`,
+        line: initNode.line,
+        column: initNode.column
+      });
+      continue;
+    }
+
+    if (!exprNode) {
+      context.errors.push({
+        type: "Semantico",
+        description: `La inicialización del campo "${fieldName}" está incompleta.`,
+        line: initNode.line,
+        column: initNode.column
+      });
+      continue;
+    }
+
+    if (seen.has(fieldName)) {
+      context.errors.push({
+        type: "Semantico",
+        description: `El campo "${fieldName}" está repetido en el literal del struct "${structName}".`,
+        line: initNode.line,
+        column: initNode.column
+      });
+      continue;
+    }
+
+    seen.add(fieldName);
+
+    const evaluated = evaluateExpression(exprNode, scope, context);
+    const coerced = coerceValueToTypeName(fieldInfo.typeName, evaluated, exprNode, context);
+
+    if (coerced) {
+      fieldsObject[fieldName] = coerced;
+    }
+  }
+
+  return baseValue;
 }
+
+function evaluateIndexedAccess(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const baseNode = node.children[0];
+  const indexNode = node.children[1];
+
+  if (!baseNode || !indexNode) {
+    return pushSemanticError(context, node, "El acceso por índice está incompleto.");
+  }
+
+  const baseValue = evaluateExpression(baseNode, scope, context);
+
+  if (!isArrayValue(baseValue) && !isSliceValue(baseValue)) {
+    return pushSemanticError(
+      context,
+      node,
+      `No se puede indexar un valor de tipo ${typeStringFromValue(baseValue)}.`
+    );
+  }
+
+  const indexValue = evaluateExpression(indexNode, scope, context);
+  const index = getIndexedPosition(indexValue, indexNode, context);
+
+  if (index === null) {
+    return makeInt(0);
+  }
+
+  const items = baseValue.value as RuntimeValue[];
+
+  if (index < 0 || index >= items.length) {
+    return pushSemanticError(
+      context,
+      indexNode,
+      `El índice ${index} está fuera del rango válido.`
+    );
+  }
+
+  return valueForRead(items[index]);
+}
+
+function evaluateFieldAccess(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const baseNode = node.children[0];
+  const fieldName = node.value ?? "";
+
+  if (!baseNode) {
+    return pushSemanticError(context, node, "El acceso a campo está incompleto.");
+  }
+
+  const baseValue = evaluateExpression(baseNode, scope, context);
+
+  if (!isStructValue(baseValue)) {
+    return pushSemanticError(
+      context,
+      node,
+      `No se puede acceder a un campo sobre un valor de tipo ${typeStringFromValue(baseValue)}.`
+    );
+  }
+
+  const fieldsObject = baseValue.value as Record<string, RuntimeValue>;
+
+  if (!(fieldName in fieldsObject)) {
+    return pushSemanticError(
+      context,
+      node,
+      `El campo "${fieldName}" no existe en el struct "${baseValue.structName}".`
+    );
+  }
+
+  return valueForRead(fieldsObject[fieldName]);
+}
+
+/*
+  ============================================================
+  EXPRESIONES
+  ============================================================
+*/
+
+function evaluateBinaryExpression(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const leftNode = node.children[0];
+  const rightNode = node.children[1];
+
+  if (!leftNode || !rightNode) {
+    return pushSemanticError(context, node, "La expresión binaria está incompleta.");
+  }
+
+  const operator = node.value ?? "";
+
+  if (operator === "&&") {
+    const left = evaluateExpression(leftNode, scope, context);
+    const leftBool = expectBoolean(left, node, context, "&&");
+
+    if (leftBool === null) {
+      return makeInt(0);
+    }
+
+    if (!leftBool) {
+      return makeBool(false);
+    }
+
+    const right = evaluateExpression(rightNode, scope, context);
+    const rightBool = expectBoolean(right, node, context, "&&");
+
+    if (rightBool === null) {
+      return makeInt(0);
+    }
+
+    return makeBool(rightBool);
+  }
+
+  if (operator === "||") {
+    const left = evaluateExpression(leftNode, scope, context);
+    const leftBool = expectBoolean(left, node, context, "||");
+
+    if (leftBool === null) {
+      return makeInt(0);
+    }
+
+    if (leftBool) {
+      return makeBool(true);
+    }
+
+    const right = evaluateExpression(rightNode, scope, context);
+    const rightBool = expectBoolean(right, node, context, "||");
+
+    if (rightBool === null) {
+      return makeInt(0);
+    }
+
+    return makeBool(rightBool);
+  }
+
+  const left = evaluateExpression(leftNode, scope, context);
+  const right = evaluateExpression(rightNode, scope, context);
+
+  switch (operator) {
+    case "+":
+      return evaluateAddition(left, right, node, context);
+    case "-":
+      return evaluateSubtraction(left, right, node, context);
+    case "*":
+      return evaluateMultiplication(left, right, node, context);
+    case "/":
+      return evaluateDivision(left, right, node, context);
+    case "%":
+      return evaluateModulo(left, right, node, context);
+    case "==":
+      return evaluateEqualityComparison(left, right, "==", node, context);
+    case "!=":
+      return evaluateEqualityComparison(left, right, "!=", node, context);
+    case ">":
+      return evaluateRelationalComparison(left, right, ">", node, context);
+    case "<":
+      return evaluateRelationalComparison(left, right, "<", node, context);
+    case ">=":
+      return evaluateRelationalComparison(left, right, ">=", node, context);
+    case "<=":
+      return evaluateRelationalComparison(left, right, "<=", node, context);
+    default:
+      return pushSemanticError(
+        context,
+        node,
+        `El operador "${operator}" todavía no está soportado.`
+      );
+  }
+}
+
+function evaluateExpression(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  switch (node.kind) {
+    case "IntLiteral":
+      return makeInt(Number(node.value ?? "0"));
+
+    case "FloatLiteral":
+      return makeFloat(Number(node.value ?? "0"));
+
+    case "StringLiteral":
+      return makeString(node.value ?? "");
+
+    case "BoolLiteral":
+      return makeBool(node.value === "true");
+
+    case "RuneLiteral":
+      return makeRune(node.value ?? "\0");
+
+    case "Identifier": {
+      const resolved = resolveVariable(scope, node.value ?? "");
+
+      if (!resolved) {
+        return pushSemanticError(
+          context,
+          node,
+          `La variable "${node.value}" no ha sido declarada.`
+        );
+      }
+
+      return valueForRead(resolved);
+    }
+
+    case "CallExpression":
+      return evaluateCallExpression(node, scope, context);
+
+    case "ArrayLiteral":
+      return evaluateArrayLiteral(node, scope, context);
+
+    case "SliceLiteral":
+      return evaluateSliceLiteral(node, scope, context);
+
+    case "StructLiteral":
+      return evaluateStructLiteral(node, scope, context);
+
+    case "ArrayAccess":
+      return evaluateIndexedAccess(node, scope, context);
+
+    case "FieldAccess":
+      return evaluateFieldAccess(node, scope, context);
+
+    case "UnaryExpression": {
+      const child = node.children[0];
+
+      if (!child) {
+        return pushSemanticError(context, node, "La expresión unaria está incompleta.");
+      }
+
+      const value = evaluateExpression(child, scope, context);
+
+      if (node.value === "-") {
+        return evaluateUnaryMinus(value, node, context);
+      }
+
+      if (node.value === "!") {
+        return evaluateLogicalNot(value, node, context);
+      }
+
+      return pushSemanticError(
+        context,
+        node,
+        `El operador unario "${node.value}" todavía no está soportado.`
+      );
+    }
+
+    case "BinaryExpression":
+      return evaluateBinaryExpression(node, scope, context);
+
+    default:
+      return pushSemanticError(
+        context,
+        node,
+        `La expresión "${node.kind}" todavía no está soportada en esta etapa.`
+      );
+  }
+}
+
+/*
+  ============================================================
+  REFERENCIAS ASIGNABLES
+  ============================================================
+*/
+
+function resolveAssignableReference(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): AssignableReference | null {
+  switch (node.kind) {
+    case "Identifier": {
+      const frame = findVariableFrame(scope, node.value ?? "");
+
+      if (!frame) {
+        context.errors.push({
+          type: "Semantico",
+          description: `La variable "${node.value}" no ha sido declarada.`,
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const currentValue = frame.values.get(node.value ?? "");
+
+      if (!currentValue) {
+        context.errors.push({
+          type: "Semantico",
+          description: `La variable "${node.value}" no pudo resolverse correctamente.`,
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      return {
+        currentValue,
+        setValue(nextValue: RuntimeValue) {
+          frame.values.set(node.value ?? "", nextValue);
+        }
+      };
+    }
+
+    case "ArrayAccess": {
+      const baseNode = node.children[0];
+      const indexNode = node.children[1];
+
+      if (!baseNode || !indexNode) {
+        context.errors.push({
+          type: "Semantico",
+          description: "La referencia indexada está incompleta.",
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const baseRef = resolveAssignableReference(baseNode, scope, context);
+
+      if (!baseRef) {
+        return null;
+      }
+
+      if (!isArrayValue(baseRef.currentValue) && !isSliceValue(baseRef.currentValue)) {
+        context.errors.push({
+          type: "Semantico",
+          description: `No se puede indexar un valor de tipo ${typeStringFromValue(baseRef.currentValue)}.`,
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const indexValue = evaluateExpression(indexNode, scope, context);
+      const index = getIndexedPosition(indexValue, indexNode, context);
+
+      if (index === null) {
+        return null;
+      }
+
+      const items = baseRef.currentValue.value as RuntimeValue[];
+
+      if (index < 0 || index >= items.length) {
+        context.errors.push({
+          type: "Semantico",
+          description: `El índice ${index} está fuera del rango válido.`,
+          line: indexNode.line,
+          column: indexNode.column
+        });
+        return null;
+      }
+
+      const currentValue = items[index];
+
+      return {
+        currentValue,
+        setValue(nextValue: RuntimeValue) {
+          items[index] = nextValue;
+        }
+      };
+    }
+
+    case "FieldAccess": {
+      const baseNode = node.children[0];
+      const fieldName = node.value ?? "";
+
+      if (!baseNode) {
+        context.errors.push({
+          type: "Semantico",
+          description: "La referencia a campo está incompleta.",
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const baseRef = resolveAssignableReference(baseNode, scope, context);
+
+      if (!baseRef) {
+        return null;
+      }
+
+      if (!isStructValue(baseRef.currentValue)) {
+        context.errors.push({
+          type: "Semantico",
+          description: `No se puede acceder a un campo sobre un valor de tipo ${typeStringFromValue(baseRef.currentValue)}.`,
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const fieldsObject = baseRef.currentValue.value as Record<string, RuntimeValue>;
+
+      if (!(fieldName in fieldsObject)) {
+        context.errors.push({
+          type: "Semantico",
+          description: `El campo "${fieldName}" no existe en el struct "${baseRef.currentValue.structName}".`,
+          line: node.line,
+          column: node.column
+        });
+        return null;
+      }
+
+      const currentValue = fieldsObject[fieldName];
+
+      return {
+        currentValue,
+        setValue(nextValue: RuntimeValue) {
+          fieldsObject[fieldName] = nextValue;
+        }
+      };
+    }
+
+    default:
+      context.errors.push({
+        type: "Semantico",
+        description: "El destino de asignación no es válido.",
+        line: node.line,
+        column: node.column
+      });
+      return null;
+  }
+}
+
+/*
+  ============================================================
+  FUNCIONES
+  ============================================================
+*/
 
 function extractFunctionInfo(
   node: AstNode,
@@ -1155,7 +1686,7 @@ function extractFunctionInfo(
     }
 
     const paramName = idNode.value ?? "";
-    const typeName = (typeNode.value ?? "int") as NonVoidTypeName;
+    const typeName = typeStringFromTypeNode(typeNode);
 
     if (paramNames.has(paramName)) {
       context.errors.push({
@@ -1322,411 +1853,11 @@ function invokeFunction(
   return coercedReturn;
 }
 
-function evaluateCallExpression(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const functionName = node.value ?? "";
-  const argValues = node.children.map((child) => evaluateExpression(child, scope, context));
-  const result = invokeFunction(functionName, argValues, node, context);
-
-  if (result === null) {
-    return pushSemanticError(
-      context,
-      node,
-      `La función "${functionName}" no retorna un valor utilizable en expresiones.`
-    );
-  }
-
-  return result;
-}
-
-function evaluateArrayLiteral(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const size = Number(node.value ?? "0");
-  const typeNode = node.children[0];
-  const elementType = (typeNode?.value ?? "int") as PrimitiveType;
-  const providedExprs = node.children.slice(1);
-
-  if (providedExprs.length > size) {
-    context.errors.push({
-      type: "Semantico",
-      description: `El arreglo de tamaño ${size} no puede recibir ${providedExprs.length} valor(es) iniciales.`,
-      line: node.line,
-      column: node.column
-    });
-  }
-
-  const elements: RuntimeValue[] = [];
-
-  for (let i = 0; i < size; i++) {
-    if (i < providedExprs.length) {
-      const evaluated = evaluateExpression(providedExprs[i], scope, context);
-      const coerced = coercePrimitiveValue(elementType, evaluated, providedExprs[i], context);
-
-      if (coerced) {
-        elements.push(coerced);
-      } else {
-        elements.push(defaultValueForPrimitive(elementType));
-      }
-    } else {
-      elements.push(defaultValueForPrimitive(elementType));
-    }
-  }
-
-  return makeArray(elementType, size, elements);
-}
-
-function evaluateStructLiteral(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const structName = node.value ?? "";
-  const baseValue = createDefaultStructValue(structName, context, node);
-
-  if (!baseValue || !isStructValue(baseValue)) {
-    return makeInt(0);
-  }
-
-  const structInfo = context.structs.get(structName);
-  const fieldsObject = baseValue.value as Record<string, RuntimeValue>;
-  const seen = new Set<string>();
-
-  if (!structInfo) {
-    return makeInt(0);
-  }
-
-  for (const initNode of node.children) {
-    const fieldName = initNode.value ?? "";
-    const exprNode = initNode.children[0];
-    const fieldInfo = structInfo.fieldMap.get(fieldName);
-
-    if (!fieldInfo) {
-      context.errors.push({
-        type: "Semantico",
-        description: `El campo "${fieldName}" no existe en el struct "${structName}".`,
-        line: initNode.line,
-        column: initNode.column
-      });
-      continue;
-    }
-
-    if (!exprNode) {
-      context.errors.push({
-        type: "Semantico",
-        description: `La inicialización del campo "${fieldName}" está incompleta.`,
-        line: initNode.line,
-        column: initNode.column
-      });
-      continue;
-    }
-
-    if (seen.has(fieldName)) {
-      context.errors.push({
-        type: "Semantico",
-        description: `El campo "${fieldName}" está repetido en el literal del struct "${structName}".`,
-        line: initNode.line,
-        column: initNode.column
-      });
-      continue;
-    }
-
-    seen.add(fieldName);
-
-    const evaluated = evaluateExpression(exprNode, scope, context);
-    const coerced = coercePrimitiveValue(fieldInfo.dataType, evaluated, exprNode, context);
-
-    if (coerced) {
-      fieldsObject[fieldName] = coerced;
-    }
-  }
-
-  return baseValue;
-}
-
-function evaluateArrayAccess(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const idNode = node.children[0];
-  const indexNode = node.children[1];
-
-  if (!idNode || !indexNode) {
-    return pushSemanticError(
-      context,
-      node,
-      "El acceso a arreglo está incompleto."
-    );
-  }
-
-  const resolved = resolveVariable(scope, idNode.value ?? "");
-
-  if (!resolved) {
-    return pushSemanticError(
-      context,
-      idNode,
-      `La variable "${idNode.value}" no ha sido declarada.`
-    );
-  }
-
-  if (!isArrayValue(resolved)) {
-    return pushSemanticError(
-      context,
-      node,
-      `La variable "${idNode.value}" no es un arreglo.`
-    );
-  }
-
-  const indexValue = evaluateExpression(indexNode, scope, context);
-  const index = getArrayIndex(indexValue, indexNode, context);
-
-  if (index === null) {
-    return makeInt(0);
-  }
-
-  if (index < 0 || index >= (resolved.size as number)) {
-    return pushSemanticError(
-      context,
-      indexNode,
-      `El índice ${index} está fuera del rango del arreglo "${idNode.value}".`
-    );
-  }
-
-  const elements = resolved.value as RuntimeValue[];
-  return cloneValue(elements[index]);
-}
-
-function evaluateFieldAccess(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const objectNode = node.children[0];
-  const fieldName = node.value ?? "";
-
-  if (!objectNode) {
-    return pushSemanticError(
-      context,
-      node,
-      "El acceso a campo está incompleto."
-    );
-  }
-
-  const resolved = resolveVariable(scope, objectNode.value ?? "");
-
-  if (!resolved) {
-    return pushSemanticError(
-      context,
-      objectNode,
-      `La variable "${objectNode.value}" no ha sido declarada.`
-    );
-  }
-
-  if (!isStructValue(resolved)) {
-    return pushSemanticError(
-      context,
-      node,
-      `La variable "${objectNode.value}" no es un struct.`
-    );
-  }
-
-  const fieldsObject = resolved.value as Record<string, RuntimeValue>;
-
-  if (!(fieldName in fieldsObject)) {
-    return pushSemanticError(
-      context,
-      node,
-      `El campo "${fieldName}" no existe en el struct "${resolved.structName}".`
-    );
-  }
-
-  return cloneValue(fieldsObject[fieldName]);
-}
-
-function evaluateBinaryExpression(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  const leftNode = node.children[0];
-  const rightNode = node.children[1];
-
-  if (!leftNode || !rightNode) {
-    return pushSemanticError(context, node, "La expresión binaria está incompleta.");
-  }
-
-  const operator = node.value ?? "";
-
-  if (operator === "&&") {
-    const left = evaluateExpression(leftNode, scope, context);
-    const leftBool = expectBoolean(left, node, context, "&&");
-
-    if (leftBool === null) {
-      return makeInt(0);
-    }
-
-    if (!leftBool) {
-      return makeBool(false);
-    }
-
-    const right = evaluateExpression(rightNode, scope, context);
-    const rightBool = expectBoolean(right, node, context, "&&");
-
-    if (rightBool === null) {
-      return makeInt(0);
-    }
-
-    return makeBool(rightBool);
-  }
-
-  if (operator === "||") {
-    const left = evaluateExpression(leftNode, scope, context);
-    const leftBool = expectBoolean(left, node, context, "||");
-
-    if (leftBool === null) {
-      return makeInt(0);
-    }
-
-    if (leftBool) {
-      return makeBool(true);
-    }
-
-    const right = evaluateExpression(rightNode, scope, context);
-    const rightBool = expectBoolean(right, node, context, "||");
-
-    if (rightBool === null) {
-      return makeInt(0);
-    }
-
-    return makeBool(rightBool);
-  }
-
-  const left = evaluateExpression(leftNode, scope, context);
-  const right = evaluateExpression(rightNode, scope, context);
-
-  switch (operator) {
-    case "+":
-      return evaluateAddition(left, right, node, context);
-    case "-":
-      return evaluateSubtraction(left, right, node, context);
-    case "*":
-      return evaluateMultiplication(left, right, node, context);
-    case "/":
-      return evaluateDivision(left, right, node, context);
-    case "%":
-      return evaluateModulo(left, right, node, context);
-    case "==":
-      return evaluateEqualityComparison(left, right, "==", node, context);
-    case "!=":
-      return evaluateEqualityComparison(left, right, "!=", node, context);
-    case ">":
-      return evaluateRelationalComparison(left, right, ">", node, context);
-    case "<":
-      return evaluateRelationalComparison(left, right, "<", node, context);
-    case ">=":
-      return evaluateRelationalComparison(left, right, ">=", node, context);
-    case "<=":
-      return evaluateRelationalComparison(left, right, "<=", node, context);
-    default:
-      return pushSemanticError(
-        context,
-        node,
-        `El operador "${operator}" todavía no está soportado.`
-      );
-  }
-}
-
-function evaluateExpression(
-  node: AstNode,
-  scope: ScopeFrame,
-  context: RuntimeContext
-): RuntimeValue {
-  switch (node.kind) {
-    case "IntLiteral":
-      return makeInt(Number(node.value ?? "0"));
-
-    case "FloatLiteral":
-      return makeFloat(Number(node.value ?? "0"));
-
-    case "StringLiteral":
-      return makeString(node.value ?? "");
-
-    case "BoolLiteral":
-      return makeBool(node.value === "true");
-
-    case "RuneLiteral":
-      return makeRune(node.value ?? "\0");
-
-    case "Identifier": {
-      const resolved = resolveVariable(scope, node.value ?? "");
-
-      if (!resolved) {
-        return pushSemanticError(
-          context,
-          node,
-          `La variable "${node.value}" no ha sido declarada.`
-        );
-      }
-
-      return cloneValue(resolved);
-    }
-
-    case "CallExpression":
-      return evaluateCallExpression(node, scope, context);
-
-    case "ArrayLiteral":
-      return evaluateArrayLiteral(node, scope, context);
-
-    case "StructLiteral":
-      return evaluateStructLiteral(node, scope, context);
-
-    case "ArrayAccess":
-      return evaluateArrayAccess(node, scope, context);
-
-    case "FieldAccess":
-      return evaluateFieldAccess(node, scope, context);
-
-    case "UnaryExpression": {
-      const child = node.children[0];
-
-      if (!child) {
-        return pushSemanticError(context, node, "La expresión unaria está incompleta.");
-      }
-
-      const value = evaluateExpression(child, scope, context);
-
-      if (node.value === "-") {
-        return evaluateUnaryMinus(value, node, context);
-      }
-
-      if (node.value === "!") {
-        return evaluateLogicalNot(value, node, context);
-      }
-
-      return pushSemanticError(
-        context,
-        node,
-        `El operador unario "${node.value}" todavía no está soportado.`
-      );
-    }
-
-    case "BinaryExpression":
-      return evaluateBinaryExpression(node, scope, context);
-
-    default:
-      return pushSemanticError(
-        context,
-        node,
-        `La expresión "${node.kind}" todavía no está soportada en esta etapa.`
-      );
-  }
-}
+/*
+  ============================================================
+  EJECUTORES DE SENTENCIAS
+  ============================================================
+*/
 
 function executeNestedBlock(
   blockNode: AstNode,
@@ -1758,24 +1889,14 @@ function executeIfStatement(
   }
 
   const conditionValue = evaluateExpression(conditionNode, scope, context);
-  const conditionBool = evaluateConditionBoolean(
-    conditionValue,
-    conditionNode,
-    context,
-    "if"
-  );
+  const conditionBool = evaluateConditionBoolean(conditionValue, conditionNode, context, "if");
 
   if (conditionBool === null) {
     return null;
   }
 
   if (conditionBool) {
-    return executeNestedBlock(
-      thenBlock,
-      scope,
-      context,
-      `if@${node.line}:${node.column}`
-    );
+    return executeNestedBlock(thenBlock, scope, context, `if@${node.line}:${node.column}`);
   }
 
   if (!elseBranch) {
@@ -1789,12 +1910,7 @@ function executeIfStatement(
   }
 
   if (elseNode.kind === "Block") {
-    return executeNestedBlock(
-      elseNode,
-      scope,
-      context,
-      `else@${elseNode.line}:${elseNode.column}`
-    );
+    return executeNestedBlock(elseNode, scope, context, `else@${elseNode.line}:${elseNode.column}`);
   }
 
   if (elseNode.kind === "IfStatement") {
@@ -1854,10 +1970,14 @@ function executeIncDecStatement(
     return;
   }
 
-  if (isArrayValue(currentValue) || isStructValue(currentValue)) {
+  if (
+    isArrayValue(currentValue) ||
+    isSliceValue(currentValue) ||
+    isStructValue(currentValue)
+  ) {
     context.errors.push({
       type: "Semantico",
-      description: `La operación ${delta > 0 ? "++" : "--"} no se permite sobre arreglos o structs.`,
+      description: `La operación ${delta > 0 ? "++" : "--"} no se permite sobre arreglos, slices o structs.`,
       line: idNode.line,
       column: idNode.column
     });
@@ -2047,12 +2167,7 @@ function executeForStatement(
       }
 
       const conditionValue = evaluateExpression(conditionNode, loopScope, context);
-      const conditionBool = evaluateConditionBoolean(
-        conditionValue,
-        conditionNode,
-        context,
-        "for"
-      );
+      const conditionBool = evaluateConditionBoolean(conditionValue, conditionNode, context, "for");
 
       if (conditionBool === null) {
         return null;
@@ -2121,12 +2236,7 @@ function executeForStatement(
 
       if (conditionNode && conditionNode.kind !== "Empty") {
         const conditionValue = evaluateExpression(conditionNode, loopScope, context);
-        const conditionBool = evaluateConditionBoolean(
-          conditionValue,
-          conditionNode,
-          context,
-          "for"
-        );
+        const conditionBool = evaluateConditionBoolean(conditionValue, conditionNode, context, "for");
 
         if (conditionBool === null) {
           return null;
@@ -2181,178 +2291,150 @@ function executeForStatement(
   return null;
 }
 
-function executeArrayAssignment(
+/*
+  for índice, valor := range slice { ... }
+*/
+function executeForRangeStatement(
   node: AstNode,
   scope: ScopeFrame,
   context: RuntimeContext
-): void {
-  const idNode = node.children[0];
-  const indexNode = node.children[1];
-  const valueNode = node.children[2];
+): StatementResult {
+  const indexNode = node.children[0];
+  const valueNode = node.children[1];
+  const targetNode = node.children[2];
+  const blockNode = node.children[3];
 
-  if (!idNode || !indexNode || !valueNode) {
+  if (!indexNode || !valueNode || !targetNode || !blockNode) {
     context.errors.push({
       type: "Semantico",
-      description: "La asignación a arreglo está incompleta.",
+      description: "La sentencia for-range está incompleta.",
       line: node.line,
       column: node.column
     });
-    return;
+    return null;
   }
 
-  const frame = findVariableFrame(scope, idNode.value ?? "");
+  const indexName = indexNode.value ?? "";
+  const valueName = valueNode.value ?? "";
 
-  if (!frame) {
+  if (indexName === valueName) {
     context.errors.push({
       type: "Semantico",
-      description: `La variable "${idNode.value}" no ha sido declarada.`,
-      line: idNode.line,
-      column: idNode.column
+      description: "Las variables índice y valor del range no pueden tener el mismo nombre.",
+      line: node.line,
+      column: node.column
     });
-    return;
+    return null;
   }
 
-  const currentValue = frame.values.get(idNode.value ?? "");
+  const iterable = evaluateExpression(targetNode, scope, context);
 
-  if (!currentValue) {
+  if (!isSliceValue(iterable) && !isArrayValue(iterable)) {
     context.errors.push({
       type: "Semantico",
-      description: `La variable "${idNode.value}" no pudo resolverse correctamente.`,
-      line: idNode.line,
-      column: idNode.column
+      description: `La sentencia range solo acepta arrays o slices, pero recibió ${typeStringFromValue(iterable)}.`,
+      line: targetNode.line,
+      column: targetNode.column
     });
-    return;
+    return null;
   }
 
-  if (!isArrayValue(currentValue)) {
+  const loopScope = createScope(`range@${node.line}:${node.column}`, scope);
+  const items = iterable.value as RuntimeValue[];
+  const elementType = iterable.elementType ?? "int";
+
+  if (loopScope.values.has(indexName) || loopScope.values.has(valueName)) {
     context.errors.push({
       type: "Semantico",
-      description: `La variable "${idNode.value}" no es un arreglo.`,
-      line: idNode.line,
-      column: idNode.column
+      description: "Las variables del range ya existen en el ámbito actual.",
+      line: node.line,
+      column: node.column
     });
-    return;
+    return null;
   }
 
-  const indexValue = evaluateExpression(indexNode, scope, context);
-  const index = getArrayIndex(indexValue, indexNode, context);
-
-  if (index === null) {
-    return;
-  }
-
-  if (index < 0 || index >= (currentValue.size as number)) {
-    context.errors.push({
-      type: "Semantico",
-      description: `El índice ${index} está fuera del rango del arreglo "${idNode.value}".`,
-      line: indexNode.line,
-      column: indexNode.column
-    });
-    return;
-  }
-
-  const newValue = evaluateExpression(valueNode, scope, context);
-  const coerced = coercePrimitiveValue(
-    currentValue.elementType as PrimitiveType,
-    newValue,
-    valueNode,
-    context
+  loopScope.values.set(indexName, makeInt(0));
+  registerSymbol(
+    context.symbolTable,
+    indexName,
+    "Variable",
+    "int",
+    loopScope.name,
+    indexNode.line,
+    indexNode.column
   );
 
-  if (!coerced) {
-    return;
+  const defaultVal = defaultValueForTypeName(elementType, context, valueNode) ?? makeInt(0);
+  loopScope.values.set(valueName, defaultVal);
+  registerSymbol(
+    context.symbolTable,
+    valueName,
+    "Variable",
+    elementType,
+    loopScope.name,
+    valueNode.line,
+    valueNode.column
+  );
+
+  for (let i = 0; i < items.length; i++) {
+    loopScope.values.set(indexName, makeInt(i));
+    loopScope.values.set(valueName, valueForRead(items[i]));
+
+    const bodySignal = executeNestedBlock(
+      blockNode,
+      loopScope,
+      context,
+      `range-body@${node.line}:${node.column}#${i}`
+    );
+
+    if (bodySignal?.kind === "break") {
+      return null;
+    }
+
+    if (bodySignal?.kind === "continue") {
+      continue;
+    }
+
+    if (bodySignal?.kind === "return") {
+      return bodySignal;
+    }
   }
 
-  const elements = currentValue.value as RuntimeValue[];
-  elements[index] = coerced;
+  return null;
 }
 
-function executeFieldAssignment(
+function executeAssignment(
   node: AstNode,
   scope: ScopeFrame,
   context: RuntimeContext
 ): void {
-  const objectNode = node.children[0];
+  const targetNode = node.children[0];
   const valueNode = node.children[1];
-  const fieldName = node.value ?? "";
 
-  if (!objectNode || !valueNode) {
+  if (!targetNode || !valueNode) {
     context.errors.push({
       type: "Semantico",
-      description: "La asignación a campo está incompleta.",
+      description: "La asignación está incompleta.",
       line: node.line,
       column: node.column
     });
     return;
   }
 
-  const frame = findVariableFrame(scope, objectNode.value ?? "");
+  const ref = resolveAssignableReference(targetNode, scope, context);
 
-  if (!frame) {
-    context.errors.push({
-      type: "Semantico",
-      description: `La variable "${objectNode.value}" no ha sido declarada.`,
-      line: objectNode.line,
-      column: objectNode.column
-    });
-    return;
-  }
-
-  const currentValue = frame.values.get(objectNode.value ?? "");
-
-  if (!currentValue) {
-    context.errors.push({
-      type: "Semantico",
-      description: `La variable "${objectNode.value}" no pudo resolverse correctamente.`,
-      line: objectNode.line,
-      column: objectNode.column
-    });
-    return;
-  }
-
-  if (!isStructValue(currentValue)) {
-    context.errors.push({
-      type: "Semantico",
-      description: `La variable "${objectNode.value}" no es un struct.`,
-      line: objectNode.line,
-      column: objectNode.column
-    });
-    return;
-  }
-
-  const structInfo = context.structs.get(currentValue.structName ?? "");
-
-  if (!structInfo) {
-    context.errors.push({
-      type: "Semantico",
-      description: `El struct "${currentValue.structName}" no fue encontrado.`,
-      line: node.line,
-      column: node.column
-    });
-    return;
-  }
-
-  const fieldInfo = structInfo.fieldMap.get(fieldName);
-
-  if (!fieldInfo) {
-    context.errors.push({
-      type: "Semantico",
-      description: `El campo "${fieldName}" no existe en el struct "${currentValue.structName}".`,
-      line: node.line,
-      column: node.column
-    });
+  if (!ref) {
     return;
   }
 
   const evaluated = evaluateExpression(valueNode, scope, context);
-  const coerced = coercePrimitiveValue(fieldInfo.dataType, evaluated, valueNode, context);
+  const coerced = coerceValueToExistingValue(ref.currentValue, evaluated, valueNode, context);
 
   if (!coerced) {
     return;
   }
 
-  const fieldsObject = currentValue.value as Record<string, RuntimeValue>;
-  fieldsObject[fieldName] = coerced;
+  ref.setValue(coerced);
 }
 
 function executeStatement(
@@ -2374,12 +2456,12 @@ function executeStatement(
     case "ExpressionStatement": {
       const exprNode = node.children[0];
 
-      if (exprNode?.kind === "CallExpression") {
-        const functionName = exprNode.value ?? "";
-        const argValues = exprNode.children.map((child) =>
-          evaluateExpression(child, scope, context)
-        );
-        invokeFunction(functionName, argValues, exprNode, context);
+      if (exprNode) {
+        if (exprNode.kind === "CallExpression") {
+          executeCallStatement(exprNode, scope, context);
+        } else {
+          evaluateExpression(exprNode, scope, context);
+        }
       }
 
       return null;
@@ -2390,6 +2472,9 @@ function executeStatement(
 
     case "ForStatement":
       return executeForStatement(node, scope, context);
+
+    case "ForRangeStatement":
+      return executeForRangeStatement(node, scope, context);
 
     case "SwitchStatement":
       return executeSwitchStatement(node, scope, context);
@@ -2513,62 +2598,8 @@ function executeStatement(
       return null;
     }
 
-    case "Assignment": {
-      const idNode = node.children[0];
-      const exprNode = node.children[1];
-
-      if (!idNode || !exprNode) {
-        context.errors.push({
-          type: "Semantico",
-          description: "La asignación está incompleta.",
-          line: node.line,
-          column: node.column
-        });
-        return null;
-      }
-
-      const varName = idNode.value ?? "";
-      const frame = findVariableFrame(scope, varName);
-
-      if (!frame) {
-        context.errors.push({
-          type: "Semantico",
-          description: `La variable "${varName}" no ha sido declarada.`,
-          line: idNode.line,
-          column: idNode.column
-        });
-        return null;
-      }
-
-      const currentValue = frame.values.get(varName);
-
-      if (!currentValue) {
-        context.errors.push({
-          type: "Semantico",
-          description: `La variable "${varName}" no pudo resolverse correctamente.`,
-          line: idNode.line,
-          column: idNode.column
-        });
-        return null;
-      }
-
-      const exprValue = evaluateExpression(exprNode, scope, context);
-      const finalValue = coerceValueToExistingValue(currentValue, exprValue, exprNode, context);
-
-      if (!finalValue) {
-        return null;
-      }
-
-      frame.values.set(varName, finalValue);
-      return null;
-    }
-
-    case "ArrayAssignment":
-      executeArrayAssignment(node, scope, context);
-      return null;
-
-    case "FieldAssignment":
-      executeFieldAssignment(node, scope, context);
+    case "Assignment":
+      executeAssignment(node, scope, context);
       return null;
 
     default:
@@ -2597,6 +2628,12 @@ function executeBlock(
 
   return null;
 }
+
+/*
+  ============================================================
+  EJECUCIÓN PRINCIPAL
+  ============================================================
+*/
 
 export function executeSource(source: string): ExecutionResult {
   const normalized = source.replace(/\r\n/g, "\n");
@@ -2784,4 +2821,409 @@ export function executeSource(source: string): ExecutionResult {
     ast,
     astDot: astToDot(ast)
   };
+}
+
+/*
+  ============================================================
+  OPERACIONES ARITMÉTICAS Y LÓGICAS
+  ============================================================
+*/
+
+function evaluateAddition(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "+" no es válida con arreglos, slices o structs.'
+    );
+  }
+
+  if (left.dataType === "string" || right.dataType === "string") {
+    return makeString(`${formatValueForPrint(left)}${formatValueForPrint(right)}`);
+  }
+
+  if (left.dataType === "float64" || right.dataType === "float64") {
+    const l = toFloatCompatibleNumber(left, node, context, "+");
+    const r = toFloatCompatibleNumber(right, node, context, "+");
+
+    if (l === null || r === null) {
+      return makeInt(0);
+    }
+
+    return makeFloat(l + r);
+  }
+
+  if (left.dataType === "bool" && right.dataType === "bool") {
+    return makeBool(Boolean(left.value) || Boolean(right.value));
+  }
+
+  const l = toIntLikeNumber(left, node, context, "+");
+  const r = toIntLikeNumber(right, node, context, "+");
+
+  if (l === null || r === null) {
+    return makeInt(0);
+  }
+
+  return makeInt(l + r);
+}
+
+function evaluateSubtraction(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "-" no es válida con arreglos, slices o structs.'
+    );
+  }
+
+  if (left.dataType === "string" || right.dataType === "string") {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "-" no es válida con valores string.'
+    );
+  }
+
+  if (left.dataType === "float64" || right.dataType === "float64") {
+    const l = toFloatCompatibleNumber(left, node, context, "-");
+    const r = toFloatCompatibleNumber(right, node, context, "-");
+
+    if (l === null || r === null) {
+      return makeInt(0);
+    }
+
+    return makeFloat(l - r);
+  }
+
+  if (left.dataType === "bool" && right.dataType === "bool") {
+    return makeInt(
+      boolToInt(Boolean(left.value)) - boolToInt(Boolean(right.value))
+    );
+  }
+
+  if (left.dataType === "bool" && right.dataType === "rune") {
+    return makeInt(
+      boolToInt(Boolean(left.value)) + runeToCode(String(right.value))
+    );
+  }
+
+  const l = toIntLikeNumber(left, node, context, "-");
+  const r = toIntLikeNumber(right, node, context, "-");
+
+  if (l === null || r === null) {
+    return makeInt(0);
+  }
+
+  return makeInt(l - r);
+}
+
+function evaluateMultiplication(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "*" no es válida con arreglos, slices o structs.'
+    );
+  }
+
+  if (left.dataType === "int" && right.dataType === "string") {
+    const count = Math.trunc(Number(left.value));
+
+    if (count < 0) {
+      return pushSemanticError(
+        context,
+        node,
+        "No se puede repetir una cadena una cantidad negativa de veces."
+      );
+    }
+
+    return makeString(String(right.value).repeat(count));
+  }
+
+  if (left.dataType === "string" || right.dataType === "string") {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "*" solo permite repetición con int * string.'
+    );
+  }
+
+  if (left.dataType === "float64" || right.dataType === "float64") {
+    const l = toFloatCompatibleNumber(left, node, context, "*");
+    const r = toFloatCompatibleNumber(right, node, context, "*");
+
+    if (l === null || r === null) {
+      return makeInt(0);
+    }
+
+    return makeFloat(l * r);
+  }
+
+  if (left.dataType === "bool" && right.dataType === "bool") {
+    return makeBool(Boolean(left.value) && Boolean(right.value));
+  }
+
+  const l = toIntLikeNumber(left, node, context, "*");
+  const r = toIntLikeNumber(right, node, context, "*");
+
+  if (l === null || r === null) {
+    return makeInt(0);
+  }
+
+  return makeInt(l * r);
+}
+
+function evaluateDivision(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "/" no es válida con arreglos, slices o structs.'
+    );
+  }
+
+  const leftAllowed = left.dataType === "int" || left.dataType === "float64";
+  const rightAllowed = right.dataType === "int" || right.dataType === "float64";
+
+  if (!leftAllowed || !rightAllowed) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "/" solo acepta valores int y float64.'
+    );
+  }
+
+  const l = Number(left.value);
+  const r = Number(right.value);
+
+  if (r === 0) {
+    return pushSemanticError(context, node, "No se puede dividir entre 0.");
+  }
+
+  if (left.dataType === "int" && right.dataType === "int") {
+    return makeInt(Math.trunc(l / r));
+  }
+
+  return makeFloat(l / r);
+}
+
+function evaluateModulo(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "%" no es válida con arreglos, slices o structs.'
+    );
+  }
+
+  if (left.dataType !== "int" || right.dataType !== "int") {
+    return pushSemanticError(
+      context,
+      node,
+      'La operación "%" solo acepta valores int.'
+    );
+  }
+
+  const l = Number(left.value);
+  const r = Number(right.value);
+
+  if (r === 0) {
+    return pushSemanticError(context, node, "No se puede calcular módulo entre 0.");
+  }
+
+  return makeInt(l % r);
+}
+
+function evaluateUnaryMinus(
+  value: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (isArrayValue(value) || isSliceValue(value) || isStructValue(value)) {
+    return pushSemanticError(
+      context,
+      node,
+      "La negación unaria no se aplica a arreglos, slices o structs."
+    );
+  }
+
+  if (value.dataType === "int") {
+    return makeInt(-Number(value.value));
+  }
+
+  if (value.dataType === "float64") {
+    return makeFloat(-Number(value.value));
+  }
+
+  return pushSemanticError(
+    context,
+    node,
+    "La negación unaria solo se aplica a int y float64."
+  );
+}
+
+function evaluateLogicalNot(
+  value: RuntimeValue,
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  const boolValue = expectBoolean(value, node, context, "!");
+
+  if (boolValue === null) {
+    return makeInt(0);
+  }
+
+  return makeBool(!boolValue);
+}
+
+function evaluateEqualityComparison(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  operator: "==" | "!=",
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  const result = areEqualValues(left, right, node, context);
+
+  if (result === null) {
+    return makeInt(0);
+  }
+
+  return makeBool(operator === "==" ? result : !result);
+}
+
+function evaluateRelationalComparison(
+  left: RuntimeValue,
+  right: RuntimeValue,
+  operator: ">" | "<" | ">=" | "<=",
+  node: AstNode,
+  context: RuntimeContext
+): RuntimeValue {
+  if (
+    isArrayValue(left) ||
+    isArrayValue(right) ||
+    isSliceValue(left) ||
+    isSliceValue(right) ||
+    isStructValue(left) ||
+    isStructValue(right)
+  ) {
+    return pushSemanticError(
+      context,
+      node,
+      `No se puede comparar ${typeStringFromValue(left)} con ${typeStringFromValue(right)} usando "${operator}".`
+    );
+  }
+
+  let result: boolean | null = null;
+
+  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
+  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+
+  if (leftNumeric && rightNumeric) {
+    const l = Number(left.value);
+    const r = Number(right.value);
+
+    switch (operator) {
+      case ">":
+        result = l > r;
+        break;
+      case "<":
+        result = l < r;
+        break;
+      case ">=":
+        result = l >= r;
+        break;
+      case "<=":
+        result = l <= r;
+        break;
+    }
+  } else if (left.dataType === "rune" && right.dataType === "rune") {
+    const l = runeToCode(String(left.value));
+    const r = runeToCode(String(right.value));
+
+    switch (operator) {
+      case ">":
+        result = l > r;
+        break;
+      case "<":
+        result = l < r;
+        break;
+      case ">=":
+        result = l >= r;
+        break;
+      case "<=":
+        result = l <= r;
+        break;
+    }
+  } else {
+    context.errors.push({
+      type: "Semantico",
+      description: `No se puede comparar ${typeStringFromValue(left)} con ${typeStringFromValue(right)} usando "${operator}".`,
+      line: node.line,
+      column: node.column
+    });
+    return makeInt(0);
+  }
+
+  return makeBool(Boolean(result));
 }
