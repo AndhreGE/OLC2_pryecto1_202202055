@@ -118,7 +118,7 @@ function applyPostfixOps(base, ops) {
 
 %%
 [ \t\r\n]+                                      /* ignorar espacios */
-"//"[^\n]*                                      /* comentario de una línea */
+"//"[^\n]*                                      /* comentario una línea */
 
 "func"                                          return 'FUNC';
 "var"                                           return 'VAR';
@@ -230,6 +230,9 @@ top_level_decl
   ============================================================
   STRUCTS
   ============================================================
+  Soporta:
+    type Persona struct { ... }
+    struct Persona { ... }
 */
 
 struct_decl
@@ -269,6 +272,11 @@ struct_field_sep_opt
         { $$ = null; }
     ;
 
+/*
+  Soporta ambos estilos:
+    nombre string
+    string nombre
+*/
 struct_field_decl
     : IDENTIFIER field_type
         {
@@ -441,7 +449,12 @@ else_part_opt
   ============================================================
   FOR
   ============================================================
-  Separamos las 3 formas para evitar conflictos.
+  Soporta:
+    for condicion { ... }
+    for init ; cond ; update { ... }
+    for i, valor := range numeros { ... }
+    for i := range numeros { ... }
+    for _, valor := range numeros { ... }
 */
 
 for_stmt
@@ -476,18 +489,39 @@ for_classic_stmt
     ;
 
 /*
-  range_iterable NO usa postfix_expression completo para evitar
-  que "range numeros {" choque con struct literals tipo:
-    numeros { ... }
+  IMPORTANTE:
+  El range simple:
+
+    for i := range numeros { ... }
+
+  chocaba con el inicio del for clásico porque ambos empiezan con:
+
+    FOR IDENTIFIER DECLARE ...
+
+  Para evitar ese conflicto, aquí se separan explícitamente las dos
+  variantes oficiales de range y se construye el mismo AST auxiliar
+  RangeBinding para el intérprete.
 */
 for_range_stmt
     : FOR IDENTIFIER ',' IDENTIFIER DECLARE RANGE range_iterable block
         {
           $$ = createNode('ForRangeStatement', null, @1, [
-            createNode('Identifier', $2, @2, []),
-            createNode('Identifier', $4, @4, []),
+            createNode('RangeBinding', 'pair', @2, [
+              createNode('Identifier', $2, @2, []),
+              createNode('Identifier', $4, @4, [])
+            ]),
             $7,
             $8
+          ]);
+        }
+    | FOR IDENTIFIER DECLARE RANGE range_iterable block
+        {
+          $$ = createNode('ForRangeStatement', null, @1, [
+            createNode('RangeBinding', 'single', @2, [
+              createNode('Identifier', $2, @2, [])
+            ]),
+            $5,
+            $6
           ]);
         }
     ;
@@ -1014,10 +1048,6 @@ call_expr
         }
     ;
 
-/*
-  Array literal:
-    [3]int{1,2,3}
-*/
 array_literal
     : '[' INT ']' array_element_type '{' expr_list_opt '}'
         {
@@ -1026,16 +1056,6 @@ array_literal
         }
     ;
 
-/*
-  Slice literal:
-    []int{1,2,3}
-
-  Slice multidimensional:
-    [][]int{
-      {1,2,3},
-      {4,5,6},
-    }
-*/
 slice_literal
     : '[' ']' slice_element_type '{' slice_item_seq_opt '}'
         {
@@ -1051,10 +1071,6 @@ slice_item
         { $$ = $1; }
     ;
 
-/*
-  Filas internas tipo:
-    {1,2,3}
-*/
 anonymous_slice_literal
     : '{' slice_item_seq_opt '}'
         {
@@ -1062,10 +1078,6 @@ anonymous_slice_literal
         }
     ;
 
-/*
-  Struct literal:
-    Persona{nombre: "Ana", edad: 20}
-*/
 struct_literal
     : IDENTIFIER '{' struct_init_seq_opt '}'
         {

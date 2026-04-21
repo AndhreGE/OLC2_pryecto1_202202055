@@ -2292,35 +2292,45 @@ function executeForStatement(
 }
 
 /*
-  for índice, valor := range slice { ... }
+  ============================================================
+  FOR RANGE OFICIAL COMPLETO
+  ============================================================
+
+  Esta versión soporta las siguientes formas oficiales:
+
+    for i, valor := range numeros { ... }
+    for i := range numeros { ... }
+    for _, valor := range numeros { ... }
+    for i, _ := range numeros { ... }
+
+  Observaciones:
+  - El AST llega con esta forma:
+      ForRangeStatement
+        children[0] = RangeBinding
+        children[1] = expresión iterable
+        children[2] = bloque
+
+  - RangeBinding puede ser:
+      value = "pair"   -> dos identificadores
+      value = "single" -> un identificador
+
+  - El identificador "_" se trata como descarte:
+      no se registra en tabla de símbolos
+      no se guarda en el scope
 */
 function executeForRangeStatement(
   node: AstNode,
   scope: ScopeFrame,
   context: RuntimeContext
 ): StatementResult {
-  const indexNode = node.children[0];
-  const valueNode = node.children[1];
-  const targetNode = node.children[2];
-  const blockNode = node.children[3];
+  const bindingNode = node.children[0];
+  const targetNode = node.children[1];
+  const blockNode = node.children[2];
 
-  if (!indexNode || !valueNode || !targetNode || !blockNode) {
+  if (!bindingNode || !targetNode || !blockNode) {
     context.errors.push({
       type: "Semantico",
       description: "La sentencia for-range está incompleta.",
-      line: node.line,
-      column: node.column
-    });
-    return null;
-  }
-
-  const indexName = indexNode.value ?? "";
-  const valueName = valueNode.value ?? "";
-
-  if (indexName === valueName) {
-    context.errors.push({
-      type: "Semantico",
-      description: "Las variables índice y valor del range no pueden tener el mismo nombre.",
       line: node.line,
       column: node.column
     });
@@ -2339,46 +2349,74 @@ function executeForRangeStatement(
     return null;
   }
 
-  const loopScope = createScope(`range@${node.line}:${node.column}`, scope);
   const items = iterable.value as RuntimeValue[];
   const elementType = iterable.elementType ?? "int";
+  const loopScope = createScope(`range@${node.line}:${node.column}`, scope);
 
-  if (loopScope.values.has(indexName) || loopScope.values.has(valueName)) {
+  const firstNode = bindingNode.children[0];
+  const secondNode = bindingNode.children[1];
+
+  if (!firstNode) {
     context.errors.push({
       type: "Semantico",
-      description: "Las variables del range ya existen en el ámbito actual.",
+      description: "El binding del range está incompleto.",
+      line: bindingNode.line,
+      column: bindingNode.column
+    });
+    return null;
+  }
+
+  const firstName = firstNode.value ?? "";
+  const secondName = secondNode?.value ?? "";
+  const isPairBinding = bindingNode.value === "pair";
+  const discardFirst = firstName === "_";
+  const discardSecond = secondName === "_";
+
+  if (isPairBinding && secondNode && firstName === secondName && firstName !== "_") {
+    context.errors.push({
+      type: "Semantico",
+      description: "Las variables índice y valor del range no pueden tener el mismo nombre.",
       line: node.line,
       column: node.column
     });
     return null;
   }
 
-  loopScope.values.set(indexName, makeInt(0));
-  registerSymbol(
-    context.symbolTable,
-    indexName,
-    "Variable",
-    "int",
-    loopScope.name,
-    indexNode.line,
-    indexNode.column
-  );
+  if (!discardFirst) {
+    loopScope.values.set(firstName, makeInt(0));
+    registerSymbol(
+      context.symbolTable,
+      firstName,
+      "Variable",
+      "int",
+      loopScope.name,
+      firstNode.line,
+      firstNode.column
+    );
+  }
 
-  const defaultVal = defaultValueForTypeName(elementType, context, valueNode) ?? makeInt(0);
-  loopScope.values.set(valueName, defaultVal);
-  registerSymbol(
-    context.symbolTable,
-    valueName,
-    "Variable",
-    elementType,
-    loopScope.name,
-    valueNode.line,
-    valueNode.column
-  );
+  if (isPairBinding && secondNode && !discardSecond) {
+    const defaultVal = defaultValueForTypeName(elementType, context, secondNode) ?? makeInt(0);
+    loopScope.values.set(secondName, defaultVal);
+    registerSymbol(
+      context.symbolTable,
+      secondName,
+      "Variable",
+      elementType,
+      loopScope.name,
+      secondNode.line,
+      secondNode.column
+    );
+  }
 
   for (let i = 0; i < items.length; i++) {
-    loopScope.values.set(indexName, makeInt(i));
-    loopScope.values.set(valueName, valueForRead(items[i]));
+    if (!discardFirst) {
+      loopScope.values.set(firstName, makeInt(i));
+    }
+
+    if (isPairBinding && secondNode && !discardSecond) {
+      loopScope.values.set(secondName, valueForRead(items[i]));
+    }
 
     const bodySignal = executeNestedBlock(
       blockNode,
