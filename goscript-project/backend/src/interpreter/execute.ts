@@ -1023,6 +1023,108 @@ function evaluateBuiltinAppend(
   return makeSlice(sliceValue.elementType as NonVoidTypeName, clonedItems);
 }
 
+function isStrictIntText(text: string): boolean {
+  return /^[+-]?\d+$/.test(text);
+}
+
+function isStrictFloatText(text: string): boolean {
+  return /^[+-]?\d+(\.\d+)?$/.test(text);
+}
+
+function evaluateBuiltinStrconvAtoi(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  if (node.children.length !== 1) {
+    return pushSemanticError(
+      context,
+      node,
+      "La función strconv.Atoi espera exactamente 1 argumento."
+    );
+  }
+
+  const rawValue = evaluateExpression(node.children[0], scope, context);
+
+  if (rawValue.dataType !== "string") {
+    return pushSemanticError(
+      context,
+      node,
+      `La función strconv.Atoi solo acepta argumentos string, pero recibió ${typeStringFromValue(rawValue)}.`
+    );
+  }
+
+  const text = String(rawValue.value);
+
+  if (!isStrictIntText(text)) {
+    return pushSemanticError(
+      context,
+      node,
+      `La función strconv.Atoi no pudo convertir "${text}" a int.`
+    );
+  }
+
+  return makeInt(Number.parseInt(text, 10));
+}
+
+function evaluateBuiltinStrconvParseFloat(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  if (node.children.length !== 1) {
+    return pushSemanticError(
+      context,
+      node,
+      "La función strconv.ParseFloat espera exactamente 1 argumento."
+    );
+  }
+
+  const rawValue = evaluateExpression(node.children[0], scope, context);
+
+  if (rawValue.dataType !== "string") {
+    return pushSemanticError(
+      context,
+      node,
+      `La función strconv.ParseFloat solo acepta argumentos string, pero recibió ${typeStringFromValue(rawValue)}.`
+    );
+  }
+
+  const text = String(rawValue.value);
+
+  if (!isStrictFloatText(text)) {
+    return pushSemanticError(
+      context,
+      node,
+      `La función strconv.ParseFloat no pudo convertir "${text}" a float64.`
+    );
+  }
+
+  return makeFloat(Number.parseFloat(text));
+}
+
+function evaluateQualifiedCallExpression(
+  node: AstNode,
+  scope: ScopeFrame,
+  context: RuntimeContext
+): RuntimeValue {
+  const qualifiedName = node.value ?? "";
+
+  if (qualifiedName === "strconv.Atoi") {
+    return evaluateBuiltinStrconvAtoi(node, scope, context);
+  }
+
+  if (qualifiedName === "strconv.ParseFloat") {
+    return evaluateBuiltinStrconvParseFloat(node, scope, context);
+  }
+
+  return pushSemanticError(
+    context,
+    node,
+    `La llamada calificada "${qualifiedName}" no está soportada todavía.`
+  );
+}
+
 function evaluateCallExpression(
   node: AstNode,
   scope: ScopeFrame,
@@ -1062,6 +1164,11 @@ function executeCallStatement(
   scope: ScopeFrame,
   context: RuntimeContext
 ): void {
+  if (node.kind === "QualifiedCallExpression") {
+    evaluateQualifiedCallExpression(node, scope, context);
+    return;
+  }
+
   const functionName = node.value ?? "";
 
   if (functionName === "len" || functionName === "append") {
@@ -1425,6 +1532,9 @@ function evaluateExpression(
 
     case "CallExpression":
       return evaluateCallExpression(node, scope, context);
+
+    case "QualifiedCallExpression":
+      return evaluateQualifiedCallExpression(node, scope, context);
 
     case "ArrayLiteral":
       return evaluateArrayLiteral(node, scope, context);
@@ -2495,7 +2605,10 @@ function executeStatement(
       const exprNode = node.children[0];
 
       if (exprNode) {
-        if (exprNode.kind === "CallExpression") {
+        if (
+          exprNode.kind === "CallExpression" ||
+          exprNode.kind === "QualifiedCallExpression"
+        ) {
           executeCallStatement(exprNode, scope, context);
         } else {
           evaluateExpression(exprNode, scope, context);

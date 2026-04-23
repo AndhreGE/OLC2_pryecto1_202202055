@@ -98,7 +98,7 @@ function applyPostfixOps(base, ops) {
 
 %locations
 
-%token FUNC VAR TYPE STRUCT FMT PRINTLN TYPE_INT TYPE_FLOAT64 TYPE_STRING TYPE_BOOL TYPE_RUNE
+%token FUNC VAR TYPE STRUCT FMT PRINTLN STRCONV TYPE_INT TYPE_FLOAT64 TYPE_STRING TYPE_BOOL TYPE_RUNE
 %token IDENTIFIER STRING INT FLOAT BOOL RUNE DECLARE EOF
 %token EQ NEQ GTE LTE AND OR NOT IF ELSE FOR INC DEC BREAK CONTINUE RETURN RANGE
 %token SWITCH CASE DEFAULT
@@ -126,6 +126,7 @@ function applyPostfixOps(base, ops) {
 "struct"                                        return 'STRUCT';
 "fmt"                                           return 'FMT';
 "Println"                                       return 'PRINTLN';
+"strconv"                                      return 'STRCONV';
 "if"                                            return 'IF';
 "else"                                          return 'ELSE';
 "for"                                           return 'FOR';
@@ -490,38 +491,32 @@ for_classic_stmt
 
 /*
   IMPORTANTE:
-  El range simple:
-
-    for i := range numeros { ... }
-
-  chocaba con el inicio del for clásico porque ambos empiezan con:
-
-    FOR IDENTIFIER DECLARE ...
-
-  Para evitar ese conflicto, aquí se separan explícitamente las dos
-  variantes oficiales de range y se construye el mismo AST auxiliar
-  RangeBinding para el intérprete.
+  Se usa range_binding y range_iterable para evitar conflictos
+  con struct literals y postfix generales.
 */
 for_range_stmt
-    : FOR IDENTIFIER ',' IDENTIFIER DECLARE RANGE range_iterable block
+    : FOR range_binding DECLARE RANGE range_iterable block
         {
           $$ = createNode('ForRangeStatement', null, @1, [
-            createNode('RangeBinding', 'pair', @2, [
-              createNode('Identifier', $2, @2, []),
-              createNode('Identifier', $4, @4, [])
-            ]),
-            $7,
-            $8
-          ]);
-        }
-    | FOR IDENTIFIER DECLARE RANGE range_iterable block
-        {
-          $$ = createNode('ForRangeStatement', null, @1, [
-            createNode('RangeBinding', 'single', @2, [
-              createNode('Identifier', $2, @2, [])
-            ]),
+            $2,
             $5,
             $6
+          ]);
+        }
+    ;
+
+range_binding
+    : IDENTIFIER ',' IDENTIFIER
+        {
+          $$ = createNode('RangeBinding', 'pair', @1, [
+            createNode('Identifier', $1, @1, []),
+            createNode('Identifier', $3, @3, [])
+          ]);
+        }
+    | IDENTIFIER
+        {
+          $$ = createNode('RangeBinding', 'single', @1, [
+            createNode('Identifier', $1, @1, [])
           ]);
         }
     ;
@@ -1045,6 +1040,10 @@ call_expr
     : IDENTIFIER '(' expr_list_opt ')'
         {
           $$ = createNode('CallExpression', $1, @1, $3);
+        }
+    | STRCONV '.' IDENTIFIER '(' expr_list_opt ')'
+        {
+          $$ = createNode('QualifiedCallExpression', 'strconv.' + $3, @1, $5);
         }
     ;
 
