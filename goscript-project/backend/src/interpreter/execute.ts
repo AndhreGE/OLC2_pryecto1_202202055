@@ -4,13 +4,13 @@ import { astToDot } from "../reports/astToDot";
 import type { CompilerError, ExecutionResult, SymbolEntry } from "../shared/types";
 
 type PrimitiveType = "int" | "float64" | "string" | "bool" | "rune";
-type RuntimeType = PrimitiveType | "array" | "slice" | "struct";
+type RuntimeType = PrimitiveType | "array" | "slice" | "struct" | "nil";
 type NonVoidTypeName = string;
 type ReturnTypeName = NonVoidTypeName | "void";
 
 interface RuntimeValue {
   dataType: RuntimeType;
-  value: number | string | boolean | RuntimeValue[] | Record<string, RuntimeValue>;
+  value: number | string | boolean | RuntimeValue[] | Record<string, RuntimeValue> | null;
   elementType?: NonVoidTypeName;
   size?: number;
   structName?: string;
@@ -200,6 +200,10 @@ function makeRune(value: string): RuntimeValue {
   return { dataType: "rune", value };
 }
 
+function makeNil(): RuntimeValue {
+  return { dataType: "nil", value: null };
+}
+
 function makeArray(
   elementType: NonVoidTypeName,
   size: number,
@@ -355,9 +359,9 @@ function defaultValueForTypeName(
   }
 
   const sliceInfo = parseSliceTypeText(typeName);
-  if (sliceInfo) {
-    return makeSlice(sliceInfo.elementType, []);
-  }
+if (sliceInfo) {
+  return makeNil();
+}
 
   const arrayInfo = parseArrayTypeText(typeName);
   if (arrayInfo) {
@@ -476,6 +480,8 @@ function formatValueForPrint(value: RuntimeValue): string {
       return String(value.value);
     case "float64":
       return formatFloat(Number(value.value));
+    case "nil":
+      return "nil";
     default:
       return String(value.value);
   }
@@ -595,6 +601,13 @@ function areEqualValues(
   node: AstNode,
   context: RuntimeContext
 ): boolean | null {
+  if (left.dataType === "nil" && right.dataType === "nil") {
+  return true;
+  }
+
+  if (left.dataType === "nil" || right.dataType === "nil") {
+    return false;
+  }
   if (
     isArrayValue(left) ||
     isArrayValue(right) ||
@@ -612,12 +625,29 @@ function areEqualValues(
     return null;
   }
 
-  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
-  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+  const leftNumericLike =
+  left.dataType === "int" ||
+  left.dataType === "float64" ||
+  left.dataType === "rune";
 
-  if (leftNumeric && rightNumeric) {
-    return Number(left.value) === Number(right.value);
-  }
+const rightNumericLike =
+  right.dataType === "int" ||
+  right.dataType === "float64" ||
+  right.dataType === "rune";
+
+if (leftNumericLike && rightNumericLike) {
+  const l =
+    left.dataType === "rune"
+      ? runeToCode(String(left.value))
+      : Number(left.value);
+
+  const r =
+    right.dataType === "rune"
+      ? runeToCode(String(right.value))
+      : Number(right.value);
+
+  return l === r;
+}
 
   if (left.dataType === right.dataType) {
     switch (left.dataType) {
@@ -719,16 +749,20 @@ function coerceValueToTypeName(
   }
 
   const sliceInfo = parseSliceTypeText(expectedType);
-  if (sliceInfo) {
-    if (!isSliceValue(value) || value.elementType !== sliceInfo.elementType) {
-      context.errors.push({
-        type: "Semantico",
-        description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
-        line: node.line,
-        column: node.column
-      });
-      return null;
-    }
+if (sliceInfo) {
+  if (value.dataType === "nil") {
+    return makeNil();
+  }
+
+  if (!isSliceValue(value) || value.elementType !== sliceInfo.elementType) {
+    context.errors.push({
+      type: "Semantico",
+      description: `No se puede asignar un valor de tipo ${typeStringFromValue(value)} a una variable de tipo ${expectedType}.`,
+      line: node.line,
+      column: node.column
+    });
+    return null;
+  }
 
     return value;
   }
@@ -1661,6 +1695,9 @@ function evaluateExpression(
 
     case "RuneLiteral":
       return makeRune(node.value ?? "\0");
+
+    case "NilLiteral":
+      return makeNil();
 
     case "Identifier": {
       const resolved = resolveVariable(scope, node.value ?? "");
@@ -3504,7 +3541,7 @@ function evaluateEqualityComparison(
   const result = areEqualValues(left, right, node, context);
 
   if (result === null) {
-    return makeInt(0);
+    return makeBool(false);
   }
 
   return makeBool(operator === "==" ? result : !result);
@@ -3534,12 +3571,26 @@ function evaluateRelationalComparison(
 
   let result: boolean | null = null;
 
-  const leftNumeric = left.dataType === "int" || left.dataType === "float64";
-  const rightNumeric = right.dataType === "int" || right.dataType === "float64";
+    const leftNumericLike =
+    left.dataType === "int" ||
+    left.dataType === "float64" ||
+    left.dataType === "rune";
 
-  if (leftNumeric && rightNumeric) {
-    const l = Number(left.value);
-    const r = Number(right.value);
+  const rightNumericLike =
+    right.dataType === "int" ||
+    right.dataType === "float64" ||
+    right.dataType === "rune";
+
+  if (leftNumericLike && rightNumericLike) {
+    const l =
+      left.dataType === "rune"
+        ? runeToCode(String(left.value))
+        : Number(left.value);
+
+    const r =
+      right.dataType === "rune"
+        ? runeToCode(String(right.value))
+        : Number(right.value);
 
     switch (operator) {
       case ">":
@@ -3555,9 +3606,9 @@ function evaluateRelationalComparison(
         result = l <= r;
         break;
     }
-  } else if (left.dataType === "rune" && right.dataType === "rune") {
-    const l = runeToCode(String(left.value));
-    const r = runeToCode(String(right.value));
+  } else if (left.dataType === "string" && right.dataType === "string") {
+    const l = String(left.value);
+    const r = String(right.value);
 
     switch (operator) {
       case ">":
@@ -3580,7 +3631,7 @@ function evaluateRelationalComparison(
       line: node.line,
       column: node.column
     });
-    return makeInt(0);
+    return makeBool(false);
   }
 
   return makeBool(Boolean(result));

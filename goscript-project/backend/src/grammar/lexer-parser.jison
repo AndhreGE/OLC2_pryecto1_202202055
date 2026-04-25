@@ -104,7 +104,7 @@ function applyPostfixOps(base, ops) {
 %locations
 
 %token FUNC VAR TYPE STRUCT FMT PRINTLN STRCONV STRINGS SLICES REFLECT TYPEOF TYPE_INT TYPE_FLOAT64 TYPE_STRING TYPE_BOOL TYPE_RUNE
-%token IDENTIFIER STRING INT FLOAT BOOL RUNE DECLARE EOF
+%token IDENTIFIER STRING INT FLOAT BOOL RUNE NIL DECLARE EOF
 %token EQ NEQ GTE LTE AND OR NOT IF ELSE FOR INC DEC BREAK CONTINUE RETURN RANGE
 %token SWITCH CASE DEFAULT
 %token PLUS_ASSIGN MINUS_ASSIGN
@@ -155,6 +155,7 @@ function applyPostfixOps(base, ops) {
 "rune"                                          return 'TYPE_RUNE';
 
 "true"|"false"                                  return 'BOOL';
+"nil"                                           return 'NIL';
 
 ":="                                            return 'DECLARE';
 "=="                                            return 'EQ';
@@ -406,6 +407,8 @@ statement
         { $$ = $1; }
     | typed_decl
         { $$ = $1; }
+    | assignment
+        { $$ = $1; }
     | identifier_statement
         { $$ = $1; }
     | if_stmt
@@ -442,7 +445,7 @@ println_stmt
 */
 
 if_stmt
-    : IF expression block else_part_opt
+    : IF expression_no_struct block else_part_opt
         {
           var children = [$2, $3];
           if ($4) {
@@ -1352,6 +1355,69 @@ postfix_expression
         }
     ;
 
+primary_expression_no_struct
+    : call_expr
+        { $$ = $1; }
+    | array_literal
+        { $$ = $1; }
+    | slice_literal
+        { $$ = $1; }
+    | literal
+        { $$ = $1; }
+    | IDENTIFIER
+        { $$ = createNode('Identifier', $1, @1, []); }
+    | '(' expression ')'
+        { $$ = $2; }
+    ;
+
+postfix_expression_no_struct
+    : primary_expression_no_struct
+        { $$ = $1; }
+    | postfix_expression_no_struct '[' expression ']'
+        {
+          $$ = createNode('ArrayAccess', null, @2, [$1, $3]);
+        }
+    | postfix_expression_no_struct '.' IDENTIFIER
+        {
+          $$ = createNode('FieldAccess', $3, @2, [$1]);
+        }
+    ;
+
+expression_no_struct
+    : expression_no_struct OR expression_no_struct
+        { $$ = createNode('BinaryExpression', '||', @2, [$1, $3]); }
+    | expression_no_struct AND expression_no_struct
+        { $$ = createNode('BinaryExpression', '&&', @2, [$1, $3]); }
+    | expression_no_struct EQ expression_no_struct
+        { $$ = createNode('BinaryExpression', '==', @2, [$1, $3]); }
+    | expression_no_struct NEQ expression_no_struct
+        { $$ = createNode('BinaryExpression', '!=', @2, [$1, $3]); }
+    | expression_no_struct '>' expression_no_struct
+        { $$ = createNode('BinaryExpression', '>', @2, [$1, $3]); }
+    | expression_no_struct '<' expression_no_struct
+        { $$ = createNode('BinaryExpression', '<', @2, [$1, $3]); }
+    | expression_no_struct GTE expression_no_struct
+        { $$ = createNode('BinaryExpression', '>=', @2, [$1, $3]); }
+    | expression_no_struct LTE expression_no_struct
+        { $$ = createNode('BinaryExpression', '<=', @2, [$1, $3]); }
+    | expression_no_struct '+' expression_no_struct
+        { $$ = createNode('BinaryExpression', '+', @2, [$1, $3]); }
+    | expression_no_struct '-' expression_no_struct
+        { $$ = createNode('BinaryExpression', '-', @2, [$1, $3]); }
+    | expression_no_struct '*' expression_no_struct
+        { $$ = createNode('BinaryExpression', '*', @2, [$1, $3]); }
+    | expression_no_struct '/' expression_no_struct
+        { $$ = createNode('BinaryExpression', '/', @2, [$1, $3]); }
+    | expression_no_struct '%' expression_no_struct
+        { $$ = createNode('BinaryExpression', '%', @2, [$1, $3]); }
+    | NOT expression_no_struct %prec NOT
+        { $$ = createNode('UnaryExpression', '!', @1, [$2]); }
+    | '-' expression_no_struct %prec UMINUS
+        { $$ = createNode('UnaryExpression', '-', @1, [$2]); }
+    | postfix_expression_no_struct
+        { $$ = $1; }
+    ;
+
 /*
   ============================================================
   EXPRESIONES
@@ -1404,4 +1470,6 @@ literal
         { $$ = createNode('BoolLiteral', $1, @1, []); }
     | RUNE
         { $$ = createNode('RuneLiteral', decodeRune($1), @1, []); }
+    | NIL
+        { $$ = createNode('NilLiteral', 'nil', @1, []); }
     ;
